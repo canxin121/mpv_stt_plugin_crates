@@ -1,0 +1,9 @@
+[package]
+name = "mpv-stt-srt"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+mpv-stt-common.workspace = true
+srtlib.workspace = true
+log.workspace = true

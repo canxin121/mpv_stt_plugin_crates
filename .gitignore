@@ -1,0 +1,21 @@
+/target
+Cargo.lock
+*.so
+*.dylib
+*.dll
+*.log
+*.srt
+*.wav
+
+# Generated environment config (user-specific)
+.envrc
+.direnv/
+
+# Build artifacts
+/dist
+
+# Temporary Android build config
+.cargo/config.toml.android
+
+# Temp output
+log

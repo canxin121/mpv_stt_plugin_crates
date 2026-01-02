@@ -1,0 +1,38 @@
+[package]
+name = "mpv-stt-server"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "mpv-stt-server"
+path = "src/main.rs"
+
+[dependencies]
+mpv-stt-common.workspace = true
+mpv-stt-crypto.workspace = true
+mpv-stt-protocol.workspace = true
+mpv-stt-plugin = { path = "../mpv-stt-plugin", default-features = false }
+
+tokio.workspace = true
+tokio-util.workspace = true
+bytes = "1.11.0"
+log.workspace = true
+env_logger.workspace = true
+clap = { version = "4.5.53", features = ["derive"] }
+anyhow.workspace = true
+hound.workspace = true
+tempfile = "3.24.0"
+opus-static-sys = { git = "https://github.com/canxin121/opus-static-sys", branch = "link_issue" }
+axum = { version = "0.7.5", features = ["macros", "http1", "json"] }
+tower = "0.5.2"
+tokio-stream = "0.1.15"
+hex = "0.4"
+
+[features]
+default = ["stt_local_cpu"]
+stt_local_cpu = ["dep:whisper-rs", "mpv-stt-plugin/stt_local_cpu"]
+stt_local_cuda = ["dep:whisper-rs", "whisper-rs/cuda", "mpv-stt-plugin/stt_local_cuda"]
+
+[dependencies.whisper-rs]
+version = "0.15.1"
+optional = true

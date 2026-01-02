@@ -1,0 +1,8 @@
+[package]
+name = "mpv-stt-common"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+hound.workspace = true

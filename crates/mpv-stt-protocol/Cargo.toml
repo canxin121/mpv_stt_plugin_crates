@@ -1,0 +1,10 @@
+[package]
+name = "mpv-stt-protocol"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+mpv-stt-common.workspace = true
+mpv-stt-crypto.workspace = true
+serde.workspace = true
+postcard.workspace = true

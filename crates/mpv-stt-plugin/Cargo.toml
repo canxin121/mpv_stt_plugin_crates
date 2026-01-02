@@ -1,0 +1,55 @@
+[package]
+name = "mpv-stt-plugin"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+mpv-stt-common.workspace = true
+mpv-stt-crypto.workspace = true
+mpv-stt-protocol.workspace = true
+mpv-stt-srt.workspace = true
+
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+postcard.workspace = true
+figment = { version = "0.10.19", features = ["env", "toml"] }
+directories = "6.0.0"
+tempfile.workspace = true
+wait-timeout = "0.2.1"
+parking_lot = "0.12.5"
+log.workspace = true
+env_logger.workspace = true
+mpv-client = "1.1.0"
+translators = { version = "0.1.5", features = ["google", "tokio-async"] }
+tokio = { version = "1.48.0", features = ["rt", "time"] }
+whisper-rs = { version = "0.15.1", optional = true }
+hound.workspace = true
+libc = "0.2.178"
+futures.workspace = true
+android_logger = "0.15.1"
+hex = { version = "0.4", optional = true }
+reqwest = { version = "0.12.28", optional = true, default-features = false, features = ["blocking", "json", "multipart", "rustls-tls"] }
+opusic-sys = { path = "/mnt/disk1/shared/git/opusic-sys", optional = true }
+
+[build-dependencies]
+cc = "1.1.31"
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+ffmpeg-next = { git = "https://github.com/canxin121/rust-ffmpeg", features = [
+    "build",
+    "static",
+    "software-resampling",
+] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+ffmpeg-next = { git = "https://github.com/canxin121/rust-ffmpeg" }
+
+[features]
+default = ["stt_local_cpu"]
+stt_local_cpu = ["dep:whisper-rs"]
+stt_local_cuda = ["dep:whisper-rs", "whisper-rs/cuda"]
+stt_remote_http = ["dep:reqwest", "dep:hex", "dep:opusic-sys"]
