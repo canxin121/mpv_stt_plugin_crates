@@ -50,6 +50,12 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # ffmpeg-sys-next's static source build needs cl.exe on PATH with the
+      # MSVC INCLUDE/LIB env; bash steps don't get that by default.
+      - name: Set up MSVC environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
       - name: Build (${{ matrix.platform }})
         shell: bash
         run: |

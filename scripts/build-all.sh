@@ -101,13 +101,20 @@ ensure_mpv_prefix() {
 
     echo "libmpv.so not found for ${arch}, building mpv (android-mpv helper)..." >&2
     # Run helper with a minimal environment to avoid hitting ARG_MAX after large Android vars accumulate.
+    # IMPORTANT: redirect the helper's stdout/stderr into the build log. This
+    # function is invoked via command substitution (prefix="$(ensure_mpv_prefix
+    # ...)"), so any stdout here becomes $prefix; the android-mpv build scripts
+    # run configure/make/meson/ninja with no redirects, so their output would be
+    # captured into $prefix, and the later "export FFMPEG_DIR=$prefix" etc. would
+    # blow the environment past exec's ARG_MAX (every later command fails with
+    # "Argument list too long").
     (cd "${builder_dir}" && env -i \
         PATH="${PATH}" HOME="${HOME:-/tmp}" TERM="${TERM:-}" \
         ANDROID_MPV_WORK_DIR="${work_dir}" \
         ANDROID_MPV_PREFIX_BASE="${prefix_base}" \
         ANDROID_NDK_HOME="$(resolve_ndk)" \
         ANDROID_API="${api_default}" \
-        ./buildall.sh --arch "${arch}" mpv)
+        ./buildall.sh --arch "${arch}" mpv) >> "${BUILD_LOG}" 2>&1
 
     if [[ -f "${prefix}/lib/libmpv.so" ]]; then
         echo "${prefix}"
