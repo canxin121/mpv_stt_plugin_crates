@@ -52,11 +52,12 @@ jobs:
 
       - name: Build (${{ matrix.platform }})
         shell: bash
-        run: ./scripts/build-all.sh -p ${{ matrix.platform }} || {
-          echo "=== dist/build.log (tail) ===";
-          tail -n 100 dist/build.log || true;
-          exit 1;
-        }
+        run: |
+          ./scripts/build-all.sh -p ${{ matrix.platform }} || {
+            echo "=== dist/build.log (tail) ===";
+            tail -n 100 dist/build.log || true;
+            exit 1;
+          }
 
       - name: Upload artifacts
         if: ${{ !cancelled() && !failure() }}
