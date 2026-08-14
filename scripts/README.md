@@ -22,10 +22,12 @@
 **动态 FFmpeg 解析**(`build_desktop` 内,无源码编译):
 - macOS: 取 `FFPREFIX`(可覆盖),否则 `brew --prefix ffmpeg`,再退 `pkg-config`;
   插件直接链接 brew 的 dylib。
-- Linux / Windows: 下载 BtbN/FFmpeg-Builds 稳定别名资产
-  `releases/latest/download/ffmpeg-master-latest-{linux64|win64}-lgpl-shared.{tar.xz|zip}`,
+- Linux / Windows: 下载 BtbN/FFmpeg-Builds 的 **8.1 稳定别名**资产
+  `releases/latest/download/ffmpeg-n8.1-latest-{linux64|win64}-lgpl-shared-8.1.{tar.xz|zip}`,
   解压缓存到 `target/ffmpeg-btbn/<platform>`,`FFMPEG_DIR` 指向缓存目录;
   `FFMPEG_BTBN_URL` 可覆盖该 URL。
+  固定 8.1 而非 master 的原因:master 头已含 CUARRAY API(`CUarray`),ffmpeg-sys-next
+  9.0.0 的 bindgen wrapper 未 stub 它,在无 CUDA SDK 的机器上会绑定失败。
 - 三个平台都可通过环境变量 `FFMPEG_DIR` 直接指定(跳过自动解析)。
 - Linux / Windows 的 FFmpeg 运行时库(`.so` / `.dll`)自动复制到
   `dist/<平台>/runtime/`,随插件一起分发。

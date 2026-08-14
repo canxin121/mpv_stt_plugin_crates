@@ -657,11 +657,17 @@ FFMPEG_CACHE_DIR="${WORKSPACE_ROOT}/target/ffmpeg-btbn"
 # export FFMPEG_DIR pointing at it. Reuses the cache on subsequent runs.
 # The asset names are stable aliases, so no API lookup is needed:
 #   https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/<asset>
+#
+# The pinned release is BtbN's ffmpeg 8.1 line (ffmpeg-n8.1-latest-*): its
+# headers match what ffmpeg-sys-next 9.0.0's bindgen wrapper expects. The newer
+# master autobuild headers (ffmpeg-master-latest-*) already contain the CUARRAY
+# frame API (CUarray / CUDA_ARRAY3D_DESCRIPTOR) which the wrapper does not
+# stub, so bindgen fails on machines without a CUDA SDK.
 ensure_ffmpeg_btbn() {
     local platform="$1" suffix cache_dir archive top
     case "${platform}" in
-        linux-x86_64)   suffix="linux64-lgpl-shared.tar.xz" ;;
-        windows-x86_64) suffix="win64-lgpl-shared.zip" ;;
+        linux-x86_64)   suffix="linux64-lgpl-shared-8.1.tar.xz" ;;
+        windows-x86_64) suffix="win64-lgpl-shared-8.1.zip" ;;
         *) error "ensure_ffmpeg_btbn: unsupported platform '${platform}'"; return 1 ;;
     esac
     cache_dir="${FFMPEG_CACHE_DIR}/${platform}"
@@ -669,7 +675,7 @@ ensure_ffmpeg_btbn() {
     if [[ ! -f "${cache_dir}/.ready" ]]; then
         log "Downloading prebuilt FFmpeg package (${suffix})..."
         local asset_url
-        asset_url="${FFMPEG_BTBN_URL:-https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-${suffix}}"
+        asset_url="${FFMPEG_BTBN_URL:-https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-n8.1-latest-${suffix}}"
         archive="${FFMPEG_CACHE_DIR}/${suffix}"
         mkdir -p "${FFMPEG_CACHE_DIR}"
         curl -fL --retry 3 -o "${archive}" "${asset_url}" \
@@ -678,7 +684,7 @@ ensure_ffmpeg_btbn() {
         mkdir -p "${cache_dir}"
         if [[ "${suffix}" == *.zip ]]; then
             unzip -q "${archive}" -d "${cache_dir}"
-            # The zip's top-level dir is ffmpeg-master-latest-win64-lgpl-shared;
+            # The zip's top-level dir is ffmpeg-n8.1-latest-win64-lgpl-shared-8.1;
             # hoist it so the cache dir itself is the FFmpeg prefix.
             top="$(find "${cache_dir}" -mindepth 1 -maxdepth 1 -type d | head -1)"
             if [[ -n "${top}" && "${top}" != "${cache_dir}" ]]; then
