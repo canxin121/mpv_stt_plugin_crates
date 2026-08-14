@@ -3,14 +3,14 @@
 MPV 实时字幕插件(单 crate,多 mod)。插件是**纯远程客户端**,通过 `[stt] backend`
 配置在运行时选择后端,不内置任何本地推理引擎。
 
-[![build](https://github.com/canxin121/mpv_stt_plugin_crates/actions/workflows/build.yml/badge.svg)](https://github.com/canxin121/mpv_stt_plugin_crates/actions/workflows/build.yml)
+[![build](https://github.com/canxin121/mpv-subtitle-plugin/actions/workflows/build.yml/badge.svg)](https://github.com/canxin121/mpv-subtitle-plugin/actions/workflows/build.yml)
 
 ## 架构
 
 ### 仓库结构(单 crate)
 
 ```
-mpv_stt_plugin_crates/
+mpv-subtitle-plugin/
 ├── Cargo.toml               # 单 crate (mpv-stt-plugin, cdylib+rlib)
 ├── build.rs                 # 链接处理(macOS dynamic_lookup / Windows FORCE:UNRESOLVED / Android -lmpv)
 ├── src/
