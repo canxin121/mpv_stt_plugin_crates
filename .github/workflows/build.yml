@@ -89,9 +89,12 @@ jobs:
           mkdir -p "${{ github.workspace }}/target"
           curl -fsSL -o /tmp/android-ndk.zip \
             https://dl.google.com/android/repository/android-ndk-r29-linux.zip
+          # The zip's top-level directory IS android-ndk-r29, which already
+          # matches $ANDROID_NDK_HOME — extracting there needs no move.
           unzip -q /tmp/android-ndk.zip -d "${{ github.workspace }}/target"
-          mv "${{ github.workspace }}/target/android-ndk-r29" \
-             "$ANDROID_NDK_HOME"
+          test -d "$ANDROID_NDK_HOME/toolchains" \
+            && test -f "$ANDROID_NDK_HOME/source.properties" \
+            || { echo "NDK not laid out as expected at $ANDROID_NDK_HOME"; exit 1; }
 
       - name: Build (android)
         run: ./scripts/build-all.sh -p android -a arm64-v8a,armeabi-v7a

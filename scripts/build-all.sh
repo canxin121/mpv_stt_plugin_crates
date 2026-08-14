@@ -223,12 +223,12 @@ ensure_setup_env() {
     SETUP_ENV_DONE=1
 }
 
-# Color output (bash printf with %(%H:%M:%S)T avoids external date)
+# Color output (bash 3.2-compatible; GNU `date` provides the timestamp)
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
-timestamp() { printf '%(%H:%M:%S)T' -1; }
+timestamp() { date +%H:%M:%S; }
 log_core() { local lvl="$1"; shift; local msg="$*"; local line="${lvl}[$(timestamp)]${NC} ${msg}"; printf "%b\n" "${line}"; printf "%b\n" "${line}" >> "${BUILD_LOG}"; }
 log()  { log_core "${GREEN}" "$*"; }
 warn() { log_core "${YELLOW}[WARN]" "$*"; }
@@ -236,12 +236,21 @@ error(){ log_core "${RED}[ERROR]" "$*"; }
 
 # Platform configurations (single .so per platform/ABI, both STT backends are
 # compiled in via default features and picked at runtime via config.stt.backend).
-declare -A TARGETS=(
-    ["linux-x86_64"]="x86_64-unknown-linux-gnu"
-    ["darwin-arm64"]="aarch64-apple-darwin"
-    ["darwin-x86_64"]="x86_64-apple-darwin"
-    ["windows-x86_64"]="x86_64-pc-windows-msvc"
-)
+# Parallel arrays (bash 3.2-compatible; the GitHub macOS runner ships bash 3.2,
+# which has no associative arrays or namerefs).
+DESKTOP_PLATFORMS_ALL=(linux-x86_64 darwin-arm64 darwin-x86_64 windows-x86_64)
+DESKTOP_TARGETS=(x86_64-unknown-linux-gnu aarch64-apple-darwin x86_64-apple-darwin x86_64-pc-windows-msvc)
+
+target_for_platform() {
+    local p="$1" i
+    for i in "${!DESKTOP_PLATFORMS_ALL[@]}"; do
+        if [[ "${DESKTOP_PLATFORMS_ALL[$i]}" == "$p" ]]; then
+            echo "${DESKTOP_TARGETS[$i]}"
+            return 0
+        fi
+    done
+    return 1
+}
 
 # Android ABI configurations (details resolved via android_abi_spec in setup-deps)
 SUPPORTED_ANDROID_ABIS=("arm64-v8a" "armeabi-v7a" "x86" "x86_64")
@@ -299,30 +308,38 @@ EOUSAGE
 }
 
 print_supported() {
-    echo "Supported platforms : ${!TARGETS[*]} android"
+    echo "Supported platforms : ${DESKTOP_PLATFORMS_ALL[*]} android"
     echo "Plugin features     : ${PLUGIN_FEATURES[*]} (omit -f to build both in one .so)"
     echo "Android ABIs        : ${SUPPORTED_ANDROID_ABIS[*]}"
 }
 
 append_list() {
-    local -n _arr="$1"
+    # Append comma-separated "$2" into the global array named by "$1".
+    # (bash 3.2-compatible: no nameref; eval with a fixed internal name.)
+    local name="$1" p
     IFS=',' read -ra parts <<<"$2"
     for p in "${parts[@]}"; do
-        [[ -n "${p}" ]] && _arr+=("${p}")
+        [[ -n "$p" ]] && eval "${name}+=(\"\$p\")"
     done
 }
 
 dedup_array() {
-    local -n arr="$1"
-    declare -A seen=()
-    local deduped=()
-    for item in "${arr[@]}"; do
-        if [[ -n "${item}" && -z "${seen[$item]:-}" ]]; then
-            deduped+=("${item}")
-            seen[$item]=1
+    # Dedup the global array named by "$1" in place (bash 3.2-compatible).
+    # bash 3.2 + nounset treats expanding an EMPTY array as unbound, so the
+    # whole function runs with nounset off (no early returns to leak it).
+    set +u
+    local name="$1" seen="" item
+    local -a src out=()
+    eval "src=(\"\${$name[@]}\")"
+    for item in "${src[@]}"; do
+        if [[ -z "$item" || ",${seen}," == *",${item},"* ]]; then
+            continue
         fi
+        out+=("$item")
+        seen="${seen:+${seen},}${item}"
     done
-    arr=("${deduped[@]}")
+    eval "${name}=(\"\${out[@]}\")"
+    set -u
 }
 
 parse_args() {
@@ -371,7 +388,7 @@ parse_args() {
 
 set_defaults() {
     if [[ ${#SELECTED_PLATFORMS[@]} -eq 0 ]]; then
-        SELECTED_PLATFORMS=("${!TARGETS[@]}" "android")
+        SELECTED_PLATFORMS=("${DESKTOP_PLATFORMS_ALL[@]}" "android")
     fi
     if [[ ${#SELECTED_ANDROID_ABIS[@]} -eq 0 ]]; then
         SELECTED_ANDROID_ABIS=("${DEFAULT_ANDROID_ABIS[@]}")
@@ -393,21 +410,21 @@ is_supported_android_abi() {
 validate_inputs() {
     local ok=1
 
-    for p in "${SELECTED_PLATFORMS[@]}"; do
-        if [[ "$p" != "android" && -z "${TARGETS[$p]:-}" ]]; then
+    for p in "${SELECTED_PLATFORMS[@]+"${SELECTED_PLATFORMS[@]}"}"; do
+        if [[ "$p" != "android" && -z "$(target_for_platform "$p")" ]]; then
             echo "ERROR: Unknown platform '${p}'" >&2
             ok=0
         fi
     done
 
-    for a in "${SELECTED_ANDROID_ABIS[@]}"; do
+    for a in "${SELECTED_ANDROID_ABIS[@]+"${SELECTED_ANDROID_ABIS[@]}"}"; do
         if ! is_supported_android_abi "$a"; then
             echo "ERROR: Unknown Android ABI '${a}'" >&2
             ok=0
         fi
     done
 
-    for f in "${SELECTED_FEATURES[@]}"; do
+    for f in "${SELECTED_FEATURES[@]+"${SELECTED_FEATURES[@]}"}"; do
         local found=0
         for af in "${PLUGIN_FEATURES[@]}"; do
             if [[ "$af" == "$f" ]]; then
@@ -430,18 +447,22 @@ compute_platforms() {
     DESKTOP_PLATFORMS=()
     DO_ANDROID=0
 
-    for p in "${SELECTED_PLATFORMS[@]}"; do
+    for p in "${SELECTED_PLATFORMS[@]+"${SELECTED_PLATFORMS[@]}"}"; do
         if [[ "$p" == "android" ]]; then
             DO_ANDROID=1
-        elif [[ -n "${TARGETS[$p]:-}" ]]; then
+        elif [[ -n "$(target_for_platform "$p")" ]]; then
             DESKTOP_PLATFORMS+=("$p")
         fi
     done
 }
 
 describe_array() {
-    local -n arr="$1"
-    local fallback="$2"
+    # Print a global array named by "$1" joined by spaces, or "$2" if empty.
+    local name="$1" fallback="$2"
+    local -a arr=()
+    set +u
+    eval "arr=(\"\${$name[@]}\")"
+    set -u
     if [[ ${#arr[@]} -eq 0 ]]; then
         echo "${fallback}"
     else
@@ -451,18 +472,22 @@ describe_array() {
 
 # Build spec: with no -f we build default features (both backends, one .so);
 # with -f we build --no-default-features --features X per selected feature.
+# Writes into the global array named by "$1" (bash 3.2-compatible).
 get_build_specs() {
-    local out_var="$1"
-    local -n out="$out_var"
-    out=()
+    local name="$1" f
+    local -a feats=()
+    set +u
+    eval "feats=(\"\${SELECTED_FEATURES[@]}\")"
+    set -u
+    eval "${name}=()"
 
-    if [[ ${#SELECTED_FEATURES[@]} -eq 0 ]]; then
-        out+=("")
+    if [[ ${#feats[@]} -eq 0 ]]; then
+        eval "${name}+=(\"\")"
         return
     fi
 
-    for f in "${SELECTED_FEATURES[@]}"; do
-        out+=("$f")
+    for f in "${feats[@]}"; do
+        eval "${name}+=(\"\$f\")"
     done
 }
 
@@ -564,7 +589,8 @@ build_android_abi() {
 build_desktop() {
     local platform="$1"
     local spec="$2"
-    local target="${TARGETS[$platform]}"
+    local target
+    target="$(target_for_platform "$platform")" || { error "Unknown platform '${platform}'"; return 1; }
 
     local spec_desc
     if [[ -n "${spec}" ]]; then
@@ -630,8 +656,8 @@ generate_manifest() {
         echo "=== Build Matrix ==="
         echo ""
 
-        for platform in "${!TARGETS[@]}"; do
-            echo "Platform: ${platform} (${TARGETS[$platform]})"
+        for platform in "${DESKTOP_PLATFORMS_ALL[@]}"; do
+            echo "Platform: ${platform} ($(target_for_platform "$platform"))"
 
             if [[ -d "${DIST_DIR}/${platform}/plugin" ]]; then
                 echo "  Plugin:"
@@ -669,13 +695,14 @@ generate_manifest() {
 ensure_targets() {
     log "Ensuring Rust targets are installed..."
 
-    for platform in "${DESKTOP_PLATFORMS[@]}"; do
-        local target="${TARGETS[$platform]}"
+    for platform in "${DESKTOP_PLATFORMS[@]+"${DESKTOP_PLATFORMS[@]}"}"; do
+        local target
+        target="$(target_for_platform "$platform")" || continue
         ensure_rust_target "${target}"
     done
 
     if ((DO_ANDROID)); then
-        for abi in "${SELECTED_ANDROID_ABIS[@]}"; do
+        for abi in "${SELECTED_ANDROID_ABIS[@]+"${SELECTED_ANDROID_ABIS[@]}"}"; do
             local spec
             spec="$(android_abi_spec "$abi")" || { error "Unknown Android ABI '${abi}'"; return 1; }
             IFS=":" read -r _abi _arch rust_target _clang_target <<<"${spec}"
@@ -720,9 +747,10 @@ main() {
     local success=0
     local failed=0
 
-    # Desktop builds
-    for platform in "${DESKTOP_PLATFORMS[@]}"; do
-        for spec in "${specs[@]}"; do
+    # Desktop builds (DESKTOP_PLATFORMS may be empty — e.g. android-only —
+    # which under bash 3.2 + nounset expands to unbound; guard it).
+    for platform in "${DESKTOP_PLATFORMS[@]+"${DESKTOP_PLATFORMS[@]}"}"; do
+        for spec in "${specs[@]+"${specs[@]}"}"; do
             ((total++)) || true
             if build_desktop "${platform}" "${spec}"; then
                 ((success++)) || true
@@ -735,8 +763,8 @@ main() {
     # Android builds
     if ((DO_ANDROID)); then
         log "Building Android targets..."
-        for abi in "${SELECTED_ANDROID_ABIS[@]}"; do
-            for spec in "${specs[@]}"; do
+        for abi in "${SELECTED_ANDROID_ABIS[@]+"${SELECTED_ANDROID_ABIS[@]}"}"; do
+            for spec in "${specs[@]+"${specs[@]}"}"; do
                 ((total++)) || true
                 if build_android_abi "${abi}" "${spec}"; then
                     ((success++)) || true
