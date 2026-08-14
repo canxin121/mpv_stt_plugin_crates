@@ -665,10 +665,12 @@ build_desktop() {
     if [[ "${platform}" == windows-* ]]; then
         export FFMPEG_MARCH=""
         export FFMPEG_MTUNE=""
-        # ffmpeg's make step runs awk programs that contain backslashes
-        # (e.g. gsub(/\\/, "/")); MSYS/git-bash rewrites arguments containing
-        # backslashes before exec, corrupting them into awk syntax errors.
-        # Disable MSYS argument conversion for the whole build.
+        # MSYS/git-bash rewrites arguments containing backslashes before exec.
+        # This corrupts makefile recipes that pass backslash-containing strings
+        # to awk (ffmpeg's MSVC dep-rule used to fail with an awk syntax error
+        # because of it). Disabling argument conversion is belt-and-suspenders;
+        # the actual fix is the CI wslpath shim that makes ffmpeg's configure
+        # pick its wslpath-based dep-rule instead of the awk one (build.yml).
         export MSYS2_ARG_CONV_EXCL="*"
     else
         unset FFMPEG_MARCH FFMPEG_MTUNE

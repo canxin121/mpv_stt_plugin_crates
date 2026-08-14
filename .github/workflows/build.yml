@@ -72,6 +72,34 @@ jobs:
           }
           echo "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=${vc}/bin/Hostx64/x64/link.exe" >> "$GITHUB_ENV"
 
+      # ffmpeg's configure builds MSVC .d dependency files one of two ways:
+      # the old one pipes cl.exe's -showIncludes output through an awk program
+      # containing `gsub(/\\/, "/")`, which make/MSYS mangles into an awk
+      # syntax error on Windows (ffmpeg Trac #9043); the fixed one runs the
+      # paths through `wslpath -u`, but is only selected when `wslpath` exists
+      # on PATH. windows-latest has none, so provide a shim that performs the
+      # same Windows→unix conversion with cygpath (bundled with Git for
+      # Windows), and ffmpeg's configure takes its own fixed code path.
+      - name: Provide wslpath shim for ffmpeg (fixes MSVC dep awk)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          cat > "$RUNNER_TEMP/bin/wslpath" <<'EOF'
+          #!/usr/bin/env bash
+          # Minimal wslpath replacement for ffmpeg's MSVC dependency generation:
+          # ffmpeg's configure only invokes `wslpath -u <path>`.
+          mode="-u"
+          for arg in "$@"; do
+              case "$arg" in
+                  -a|-u|-m|-w|-p|-r|-s|-i) mode="$arg" ;;
+                  *) cygpath "$mode" "$arg" ;;
+              esac
+          done
+          EOF
+          chmod +x "$RUNNER_TEMP/bin/wslpath"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
       - name: Build (${{ matrix.platform }})
         shell: bash
         run: |
