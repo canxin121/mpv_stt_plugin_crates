@@ -52,7 +52,11 @@ jobs:
 
       - name: Build (${{ matrix.platform }})
         shell: bash
-        run: ./scripts/build-all.sh -p ${{ matrix.platform }}
+        run: ./scripts/build-all.sh -p ${{ matrix.platform }} || {
+          echo "=== dist/build.log (tail) ===";
+          tail -n 100 dist/build.log || true;
+          exit 1;
+        }
 
       - name: Upload artifacts
         if: ${{ !cancelled() && !failure() }}
@@ -97,7 +101,22 @@ jobs:
             || { echo "NDK not laid out as expected at $ANDROID_NDK_HOME"; exit 1; }
 
       - name: Build (android)
-        run: ./scripts/build-all.sh -p android -a arm64-v8a,armeabi-v7a
+        run: |
+          # Run in a minimal environment: android-mpv's cross-build piles up
+          # environment variables, which blows past exec's ARG_MAX and makes
+          # every later command (date/uname/cargo) fail with "Argument list
+          # too long". env -i keeps this job's env small; the NDK/toolchain
+          # vars are re-exported by build-all.sh itself.
+          env -i \
+            PATH="$PATH" HOME="$HOME" \
+            CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" \
+            RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" \
+            ANDROID_NDK_HOME="$ANDROID_NDK_HOME" NDK="$NDK" TERM=xterm \
+            ./scripts/build-all.sh -p android -a arm64-v8a,armeabi-v7a || {
+            echo "=== dist/build.log (tail) ===";
+            tail -n 120 dist/build.log || true;
+            exit 1;
+          }
 
       - name: Upload artifacts
         if: ${{ !cancelled() && !failure() }}
