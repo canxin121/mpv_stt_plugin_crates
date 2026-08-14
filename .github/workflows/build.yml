@@ -54,19 +54,22 @@ jobs:
         shell: bash
         run: |
           ./scripts/build-all.sh -p ${{ matrix.platform }} || {
-            echo "=== dist/build.log (tail) ===";
-            tail -n 100 dist/build.log || true;
+            echo "=== dist/build.log (tail 400) ===";
+            tail -n 400 dist/build.log || true;
+            echo "=== error-ish lines in dist/build.log ===";
+            grep -nE "error|Error|failed|Failed|cannot|not found|panic|✗|Argument list" dist/build.log | tail -n 60 || true;
             exit 1;
           }
 
       - name: Upload artifacts
-        if: ${{ !cancelled() && !failure() }}
+        if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
         with:
           name: dist-${{ matrix.platform }}
           path: |
             dist/${{ matrix.platform }}/plugin/${{ matrix.artifact }}
             dist/MANIFEST.txt
+            dist/build.log
 
   android:
     name: android (arm64-v8a, armeabi-v7a)
@@ -114,16 +117,19 @@ jobs:
             RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" \
             ANDROID_NDK_HOME="$ANDROID_NDK_HOME" NDK="$NDK" TERM=xterm \
             ./scripts/build-all.sh -p android -a arm64-v8a,armeabi-v7a || {
-            echo "=== dist/build.log (tail) ===";
-            tail -n 120 dist/build.log || true;
+            echo "=== dist/build.log (tail 400) ===";
+            tail -n 400 dist/build.log || true;
+            echo "=== error-ish lines in dist/build.log ===";
+            grep -nE "error|Error|failed|Failed|cannot|not found|panic|✗|Argument list" dist/build.log | tail -n 60 || true;
             exit 1;
           }
 
       - name: Upload artifacts
-        if: ${{ !cancelled() && !failure() }}
+        if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
         with:
           name: dist-android
           path: |
             dist/android/**/plugin/*.so
             dist/MANIFEST.txt
+            dist/build.log

@@ -131,9 +131,14 @@ setup_android_env() {
 
     local ndk_path
     ndk_path="$(ensure_ndk)" || return 1
-    local toolchain_root="${ndk_path}/toolchains/llvm/prebuilt/$(host_tag)"
+    local host_tag_val
+    host_tag_val="$(host_tag)"
+    local toolchain_root="${ndk_path}/toolchains/llvm/prebuilt/${host_tag_val}"
     if [[ ! -d "${toolchain_root}" ]]; then
+        # Diagnose the toolchain lookup: if host_tag came back with an empty
+        # arch (e.g. "linux-"), show exactly what uname reported.
         echo "Toolchain not found: ${toolchain_root}" >&2
+        echo "  (host_tag='${host_tag_val}', uname -s='$(uname -s)', uname -m='$(uname -m)', OSTYPE='${OSTYPE:-unset}')" >&2
         return 1
     fi
     local sysroot="${toolchain_root}/sysroot"
