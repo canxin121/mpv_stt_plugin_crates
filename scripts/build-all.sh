@@ -658,6 +658,17 @@ build_desktop() {
         warn "Cross-compiling ${target} from host ${host_triple}; needs a matching linker/toolchain."
     fi
 
+    # ffmpeg-sys-next passes -march=native -mtune=native to ffmpeg's configure
+    # by default; cl.exe rejects them (D8043: unknown option). Empty both on
+    # Windows so the MSVC toolchain builds with its baseline flags; restore the
+    # default (native) on other platforms so the flag isn't silently dropped.
+    if [[ "${platform}" == windows-* ]]; then
+        export FFMPEG_MARCH=""
+        export FFMPEG_MTUNE=""
+    else
+        unset FFMPEG_MARCH FFMPEG_MTUNE
+    fi
+
     if cargo "${cargo_args[@]}" >> "${BUILD_LOG}" 2>&1; then
         log "✓ mpv-stt-plugin [${spec_desc}] for ${platform}"
 
