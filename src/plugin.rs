@@ -99,6 +99,7 @@ struct PluginState {
 
     running: bool,
     shutting_down: bool,
+    translate_enabled: bool, // Ctrl+Shift+t toggles whether new STT output gets translated
     subs_loaded: bool,
     current_pos_ms: u64,
     last_playback_pos_ms: Option<u64>,
@@ -140,6 +141,7 @@ impl PluginState {
             network_cache: None,
             running: false,
             shutting_down: false,
+            translate_enabled: true,
             subs_loaded: false,
             current_pos_ms: 0,
             last_playback_pos_ms: None,
@@ -259,6 +261,47 @@ impl PluginState {
             let _ = client.command(&["show-text", "STT: On"]);
             self.start_transcription(client);
         }
+    }
+
+    fn toggle_translate(&mut self, client: &mut Handle) {
+        self.translate_enabled = !self.translate_enabled;
+        info!("Translation {}", if self.translate_enabled { "enabled" } else { "disabled" });
+        let msg = if self.translate_enabled {
+            "Translate: On"
+        } else {
+            "Translate: Off (new subtitles stay as original)"
+        };
+        let _ = client.command(&["show-text", msg, "3000"]);
+    }
+
+    /// Delete the current media's on-disk subtitle/translation cache and drop
+    /// the in-memory translation + processed-chunk state, so replaying the same
+    /// file re-transcribes instead of reusing stale cached subtitles.
+    fn clear_cache(&mut self, client: &mut Handle) {
+        let mut removed = 0usize;
+        if let Some(media_id) = Self::media_id_for_cache(client) {
+            if let Some(paths) = self.cache_paths_for_media(&media_id) {
+                for p in [&paths.subtitle_path, &paths.manifest_path] {
+                    if p.exists() {
+                        match std::fs::remove_file(p) {
+                            Ok(()) => removed += 1,
+                            Err(e) => error!("Failed to remove cache file {}: {}", p.display(), e),
+                        }
+                    }
+                }
+            }
+        }
+        // Drop in-memory state so a fresh playback re-transcribes from scratch.
+        let chunk_entries = self.translation_cache.len();
+        self.translation_cache.clear();
+        self.processed_chunks.clear();
+
+        info!(
+            "Subtitle cache cleared (removed {} files, dropped {} cached translations)",
+            removed, chunk_entries
+        );
+        let msg = format!("字幕缓存已清除: 删除 {} 个文件, 内存缓存 {} 条", removed, chunk_entries);
+        let _ = client.command(&["show-text", &msg, "3000"]);
     }
 
     fn start_transcription(&mut self, client: &mut Handle) {
@@ -882,8 +925,8 @@ impl PluginState {
             return false;
         }
 
-        // Translate using async translation queue (always enabled)
-        if !pending_tasks.is_empty() {
+        // Translate using async translation queue (Ctrl+Shift+t toggles translate_enabled)
+        if self.translate_enabled && !pending_tasks.is_empty() {
             if let Some(ref queue) = self.async_translation_queue {
                 trace!("Submitting subtitles to async translation queue");
                 for task in pending_tasks {
@@ -1284,11 +1327,16 @@ pub extern "C" fn mpv_open_cplugin(handle: *mut mpv_handle) -> std::os::raw::c_i
         // Get client name first
         let client_name = client.name().to_string();
 
-        // Register key binding
-        let key_binding = format!("Ctrl+. script-message-to {} toggle-stt", client_name);
+        // Register key bindings (multi-line define-section contents; each line
+        // is one key -> script-message-to mapping). The letter is the mnemonic:
+        // s=subtitles, t=translate, c=cache.
+        let key_bindings = format!(
+            "Ctrl+Shift+s script-message-to {} toggle-stt\nCtrl+Shift+t script-message-to {} toggle-translate\nCtrl+Shift+c script-message-to {} clear-cache",
+            client_name, client_name, client_name
+        );
         let section_name = format!("{}-input", client_name);
 
-        let _ = client.command(&["define-section", &section_name, &key_binding, "default"]);
+        let _ = client.command(&["define-section", &section_name, &key_bindings, "default"]);
         let _ = client.command(&["enable-section", &section_name]);
 
         // Set auto-start flag (will start after file loads)
@@ -1329,15 +1377,32 @@ pub extern "C" fn mpv_open_cplugin(handle: *mut mpv_handle) -> std::os::raw::c_i
                     if !args.is_empty() {
                         let command = if args[0] == "toggle-stt" {
                             Some("toggle-stt")
+                        } else if args[0] == "toggle-translate" {
+                            Some("toggle-translate")
+                        } else if args[0] == "clear-cache" {
+                            Some("clear-cache")
                         } else if args.len() > 1 && args[1] == "toggle-stt" {
                             Some("toggle-stt")
                         } else {
                             None
                         };
 
-                        if command.is_some() {
-                            debug!("Toggling STT...");
-                            state.toggle_stt(client);
+                        if let Some(command) = command {
+                            match command {
+                                "toggle-stt" => {
+                                    debug!("Toggling STT...");
+                                    state.toggle_stt(client);
+                                }
+                                "toggle-translate" => {
+                                    debug!("Toggling translation...");
+                                    state.toggle_translate(client);
+                                }
+                                "clear-cache" => {
+                                    debug!("Clearing subtitle cache...");
+                                    state.clear_cache(client);
+                                }
+                                _ => {}
+                            }
                         }
                     }
                 }
