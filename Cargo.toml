@@ -69,11 +69,11 @@ reqwest = { version = "0.12.28", default-features = false, features = [
 [build-dependencies]
 cc = "1.1.31"
 
-# Desktop: statically compile FFmpeg from source (needs git/make/clang/network).
+# Desktop: link against a prebuilt FFmpeg. With the `build` feature removed,
+# ffmpeg-sys-next uses FFMPEG_DIR (prebuilt dev package) or pkg-config instead
+# of compiling FFmpeg from source. `static` is only meaningful with `build`.
 [target.'cfg(not(target_os = "android"))'.dependencies]
 ffmpeg-next = { path = "third_party/rust-ffmpeg", features = [
-    "build",
-    "static",
     "software-resampling",
 ] }
 

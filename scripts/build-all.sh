@@ -342,6 +342,15 @@ Examples:
   # 32-bit ABIs (armeabi-v7a, x86) are currently blocked by an upstream
   # ffmpeg-sys-next Vulkan-stub assert; see DEFAULT_ANDROID_ABIS.
   ./scripts/build-all.sh -p android -a arm64-v8a
+
+Environment:
+  Desktop platforms link dynamically against a prebuilt FFmpeg (no source
+  compile):
+    FFPREFIX          macOS only: brew FFmpeg prefix (default: brew --prefix ffmpeg)
+    FFMPEG_BTBN_URL   Linux/Windows: override the auto-resolved BtbN asset URL
+    FFMPEG_DIR        If set, used as-is on every platform (CI override)
+  The BtbN packages are cached under target/ffmpeg-btbn and the Linux/Windows
+  runtime libraries are copied into dist/<platform>/runtime.
 EOUSAGE
 }
 
@@ -624,6 +633,126 @@ build_android_abi() {
 
 # Build a single desktop (non-Android) platform. `spec` is empty (default, both
 # backends) or a single feature (single-backend build).
+# --- Dynamic FFmpeg resolution (no source compile) -------------------------
+#
+# Desktop platforms link dynamically against a prebuilt FFmpeg instead of
+# compiling one from source (the `build`/`static` ffmpeg-sys-next features are
+# gone from Cargo.toml). These helpers resolve FFMPEG_DIR per platform:
+#
+#   darwin-*   brew FFmpeg prefix (FFPREFIX overrides; falls back to
+#              `brew --prefix ffmpeg`, then pkg-config). The plugin depends on
+#              the host's own dynamic libraries at their brew install paths.
+#   linux-*    BtbN/FFmpeg-Builds linux64-lgpl-shared tarball, cached under
+#              target/ffmpeg-btbn (FFMPEG_BTBN_URL overrides the auto-resolved
+#              URL). Runtime .so files are copied into dist/<platform>/runtime.
+#   windows-*  BtbN/FFmpeg-Builds win64-lgpl-shared zip, same cache; runtime
+#              .dll files are copied into dist/<platform>/runtime.
+#
+# The resolved prefix is exported as FFMPEG_DIR, which ffmpeg-sys-next's
+# prebuilt branch uses for both -L{dir}/lib and -I{dir}/include.
+
+FFMPEG_CACHE_DIR="${WORKSPACE_ROOT}/target/ffmpeg-btbn"
+
+# Download+extract a BtbN shared package into a per-platform cache dir, then
+# export FFMPEG_DIR pointing at it. Reuses the cache on subsequent runs.
+# The asset names are stable aliases, so no API lookup is needed:
+#   https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/<asset>
+ensure_ffmpeg_btbn() {
+    local platform="$1" suffix cache_dir archive top
+    case "${platform}" in
+        linux-x86_64)   suffix="linux64-lgpl-shared.tar.xz" ;;
+        windows-x86_64) suffix="win64-lgpl-shared.zip" ;;
+        *) error "ensure_ffmpeg_btbn: unsupported platform '${platform}'"; return 1 ;;
+    esac
+    cache_dir="${FFMPEG_CACHE_DIR}/${platform}"
+
+    if [[ ! -f "${cache_dir}/.ready" ]]; then
+        log "Downloading prebuilt FFmpeg package (${suffix})..."
+        local asset_url
+        asset_url="${FFMPEG_BTBN_URL:-https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-${suffix}}"
+        archive="${FFMPEG_CACHE_DIR}/${suffix}"
+        mkdir -p "${FFMPEG_CACHE_DIR}"
+        curl -fL --retry 3 -o "${archive}" "${asset_url}" \
+            || { error "Failed to download ${asset_url}"; return 1; }
+        rm -rf "${cache_dir}"
+        mkdir -p "${cache_dir}"
+        if [[ "${suffix}" == *.zip ]]; then
+            unzip -q "${archive}" -d "${cache_dir}"
+            # The zip's top-level dir is ffmpeg-master-latest-win64-lgpl-shared;
+            # hoist it so the cache dir itself is the FFmpeg prefix.
+            top="$(find "${cache_dir}" -mindepth 1 -maxdepth 1 -type d | head -1)"
+            if [[ -n "${top}" && "${top}" != "${cache_dir}" ]]; then
+                mv "${top}"/* "${cache_dir}"/ 2>/dev/null || true
+                rmdir "${top}" 2>/dev/null || true
+            fi
+        else
+            tar -xJf "${archive}" -C "${cache_dir}" --strip-components=1
+        fi
+        touch "${cache_dir}/.ready"
+    fi
+
+    export FFMPEG_DIR="${cache_dir}"
+    log "FFMPEG_DIR=${FFMPEG_DIR}"
+}
+
+# Resolve the brew FFmpeg prefix on macOS (CI sets FFPREFIX explicitly).
+ensure_ffmpeg_darwin() {
+    local prefix="${FFPREFIX:-}"
+    if [[ -z "${prefix}" ]]; then
+        prefix="$(brew --prefix ffmpeg 2>/dev/null || true)"
+    fi
+    if [[ -z "${prefix}" ]]; then
+        prefix="$(pkg-config --variable=prefix libavcodec 2>/dev/null || true)"
+    fi
+    if [[ -z "${prefix}" || ! -f "${prefix}/include/libavcodec/avcodec.h" ]]; then
+        error "No brew FFmpeg found for macOS. Install it (brew install ffmpeg) or set FFPREFIX."
+        return 1
+    fi
+    export FFMPEG_DIR="${prefix}"
+    log "FFMPEG_DIR=${FFMPEG_DIR}"
+}
+
+ensure_ffmpeg() {
+    local platform="$1"
+    if [[ -n "${FFMPEG_DIR:-}" ]]; then
+        log "Using caller-provided FFMPEG_DIR=${FFMPEG_DIR}"
+        return 0
+    fi
+    case "${platform}" in
+        darwin-*)   ensure_ffmpeg_darwin || return 1 ;;
+        linux-*)    ensure_ffmpeg_btbn "${platform}" || return 1 ;;
+        windows-*)  ensure_ffmpeg_btbn "${platform}" || return 1 ;;
+        *) error "ensure_ffmpeg: no dynamic FFmpeg source for '${platform}'"; return 1 ;;
+    esac
+}
+
+# Copy the FFmpeg runtime libraries next to the plugin so the shipped dist is
+# self-contained (Windows needs the .dll on the DLL search path; Linux needs
+# the .so available via LD_LIBRARY_PATH). macOS is skipped: the plugin links
+# the brew dylibs at their absolute install paths.
+collect_ffmpeg_runtime() {
+    local platform="$1"
+    # macOS: the plugin links the brew dylibs at their absolute install paths,
+    # so there is nothing to bundle.
+    if [[ "${platform}" == darwin-* ]]; then
+        return 0
+    fi
+    [[ -n "${FFMPEG_DIR:-}" ]] || return 0
+    local rt="${DIST_DIR}/${platform}/runtime"
+    mkdir -p "${rt}"
+    case "${platform}" in
+        linux-x86_64)
+            cp -P "${FFMPEG_DIR}"/lib/lib*.so* "${rt}"/ 2>/dev/null || true
+            ;;
+        windows-x86_64)
+            cp "${FFMPEG_DIR}"/bin/*.dll "${rt}"/ 2>/dev/null || true
+            ;;
+    esac
+    if [[ -z "$(ls -A "${rt}")" ]]; then
+        warn "No FFmpeg runtime libraries collected for ${platform} (FFMPEG_DIR=${FFMPEG_DIR:-unset})."
+    fi
+}
+
 build_desktop() {
     local platform="$1"
     local spec="$2"
@@ -650,31 +779,18 @@ build_desktop() {
         cargo_args+=("--no-default-features" "--features" "${spec}")
     fi
 
-    # ffmpeg's static source build needs a real native toolchain; warn loudly
-    # when cross-compiling a desktop target (CI builds each platform natively).
+    # Desktop links dynamically against a prebuilt FFmpeg (no source compile),
+    # so cross-compiling only needs the target linker — warn so the user isn't
+    # surprised by a missing one. (The old -march/-mtune/MSYS argument-conversion
+    # hacks were specific to ffmpeg's source build and are gone with it.)
     local host_triple
     host_triple="$(host_rust_target)"
     if [[ "${target}" != "${host_triple}" ]]; then
         warn "Cross-compiling ${target} from host ${host_triple}; needs a matching linker/toolchain."
     fi
 
-    # ffmpeg-sys-next passes -march=native -mtune=native to ffmpeg's configure
-    # by default; cl.exe rejects them (D8043: unknown option). Empty both on
-    # Windows so the MSVC toolchain builds with its baseline flags; restore the
-    # default (native) on other platforms so the flag isn't silently dropped.
-    if [[ "${platform}" == windows-* ]]; then
-        export FFMPEG_MARCH=""
-        export FFMPEG_MTUNE=""
-        # MSYS/git-bash rewrites arguments containing backslashes before exec.
-        # This corrupts makefile recipes that pass backslash-containing strings
-        # to awk (ffmpeg's MSVC dep-rule used to fail with an awk syntax error
-        # because of it). Disabling argument conversion is belt-and-suspenders;
-        # the actual fix is the CI wslpath shim that makes ffmpeg's configure
-        # pick its wslpath-based dep-rule instead of the awk one (build.yml).
-        export MSYS2_ARG_CONV_EXCL="*"
-    else
-        unset FFMPEG_MARCH FFMPEG_MTUNE
-    fi
+    # Resolve FFMPEG_DIR (brew on macOS, BtbN prebuilt on Linux/Windows).
+    ensure_ffmpeg "${platform}" || return 1
 
     if cargo "${cargo_args[@]}" >> "${BUILD_LOG}" 2>&1; then
         log "✓ mpv-stt-plugin [${spec_desc}] for ${platform}"
@@ -685,6 +801,9 @@ build_desktop() {
             local art
             art="$(artifact_name "${target}")"
             cp "${WORKSPACE_ROOT}/target/${target}/release/${art}" "${out_dir}/${art}"
+            # Ship the dynamic FFmpeg libraries alongside the plugin (Windows
+            # .dll, Linux .so); macOS keeps the brew dylibs in place.
+            collect_ffmpeg_runtime "${platform}"
         fi
         return 0
     else

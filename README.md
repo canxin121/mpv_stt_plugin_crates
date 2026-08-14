@@ -53,12 +53,18 @@ ferrum 协议的服务端由 [subtitle-gateway](https://github.com/canxin121/sub
 
 ### 系统依赖
 
+桌面平台**动态链接**预编译 FFmpeg(**不再从源码编译**):
+
+- macOS: `brew install ffmpeg`(插件链接其 dylib)
+- Linux / Windows: 构建脚本自动下载 BtbN/FFmpeg-Builds 的 `lgpl-shared`
+  预编译包到 `target/ffmpeg-btbn`,并复制运行时库到 `dist/<平台>/runtime/`
+
 | 平台 | 依赖 |
 |---|---|
-| Ubuntu/Debian | `sudo apt-get install clang make nasm pkg-config` |
-| Arch Linux | `sudo pacman -S clang make nasm pkg-config` |
-| macOS | `brew install nasm`(自带 clang/make) |
-| Windows | MSVC 工具链(ffmpeg 静态编译为 best-effort,见 CI) |
+| Ubuntu/Debian | `sudo apt-get install clang pkg-config`(clang 供 bindgen 用) |
+| Arch Linux | `sudo pacman -S clang pkg-config` |
+| macOS | `brew install ffmpeg`(自带 clang) |
+| Windows | MSVC 工具链(BtbN 预编译共享包自动下载) |
 | Android(交叉) | NDK + `meson ninja-build pkg-config cmake` |
 
 **注意**: 不需要安装 `libmpv-dev`,构建脚本自动下载 mpv 头文件(bindgen 用)。
@@ -70,17 +76,19 @@ ferrum 协议的服务端由 [subtitle-gateway](https://github.com/canxin121/sub
 cargo build --release
 cargo test
 
-# 产物(以 macOS 为例)
+# 产物(以 macOS 为例;动态链接 brew ffmpeg,约 5MB)
 ls target/release/libmpv_stt_plugin.dylib
 ```
 
 > macOS 上若 mpv 头文件不在 `/opt/homebrew/include`,需
 > `BINDGEN_EXTRA_CLANG_ARGS="-I/opt/homebrew/include" cargo build`。
+> 桌面构建需要 `FFMPEG_DIR`(macOS 由脚本自动取 `brew --prefix ffmpeg`)。
 
 ### 全平台构建
 
 ```bash
 # 全平台矩阵(桌面 4 平台 + Android 默认 arm64-v8a),每个平台/ABI 一个动态库(双后端编入)
+# Linux/Windows 自动下载 BtbN 预编译共享包,macOS 用 brew ffmpeg
 ./scripts/build-all.sh
 
 # 指定平台
@@ -93,15 +101,18 @@ export ANDROID_NDK_HOME=~/Android/Sdk/ndk/26.1.10909125
 ./scripts/build-all.sh -l   # 列出支持的平台/feature/ABI
 ```
 
-**支持平台**(CI 各平台原生编译):
+**支持平台**(CI 各平台原生编译;桌面全部动态链接 FFmpeg):
 
-| 平台 | 产物 |
-|---|---|
-| Linux x86_64 | `dist/linux-x86_64/plugin/libmpv_stt_plugin.so` |
-| macOS arm64 | `dist/darwin-arm64/plugin/libmpv_stt_plugin.dylib` |
-| macOS x86_64 | `dist/darwin-x86_64/plugin/libmpv_stt_plugin.dylib` |
-| Windows x86_64 | `dist/windows-x86_64/plugin/mpv_stt_plugin.dll`(best-effort) |
-| Android(arm64-v8a,默认) | `dist/android/<abi>/plugin/libmpv_stt_plugin.so` |
+| 平台 | FFmpeg 来源 | 产物 |
+|---|---|---|
+| Linux x86_64 | BtbN `linux64-lgpl-shared`(自动下载) | `dist/linux-x86_64/plugin/libmpv_stt_plugin.so` |
+| macOS arm64 | brew ffmpeg | `dist/darwin-arm64/plugin/libmpv_stt_plugin.dylib` |
+| macOS x86_64 | brew ffmpeg | `dist/darwin-x86_64/plugin/libmpv_stt_plugin.dylib` |
+| Windows x86_64 | BtbN `win64-lgpl-shared`(自动下载) | `dist/windows-x86_64/plugin/mpv_stt_plugin.dll` |
+| Android(arm64-v8a,默认) | Android 侧动态 libffmpeg(随 APK 分发) | `dist/android/<abi>/plugin/libmpv_stt_plugin.so` |
+
+Linux / Windows 产物旁的 `dist/<平台>/runtime/` 里是插件需要的 FFmpeg 运行时库
+(`.so` / `.dll`),分发时需一起带上。macOS 插件直接链接 brew 的 dylib(安装 ffmpeg 即可)。
 
 > **注**: `armeabi-v7a` / `x86`(32 位 ABI)暂未纳入默认构建——上游
 > `ffmpeg-sys-next` 的 Vulkan stub 头硬编码 `sizeof(VkPhysicalDeviceFeatures2) == 240`
@@ -116,13 +127,16 @@ export ANDROID_NDK_HOME=~/Android/Sdk/ndk/26.1.10909125
 
 ### 安装
 
-**插件**:
+**插件**(用 `dist/<平台>/plugin/` 里的动态库;macOS 记得先 `brew install ffmpeg`):
 ```bash
 # Linux / Android / Windows
-cp target/release/libmpv_stt_plugin.so ~/.config/mpv/scripts/
+cp dist/linux-x86_64/plugin/libmpv_stt_plugin.so ~/.config/mpv/scripts/
 # macOS
-cp target/release/libmpv_stt_plugin.dylib ~/.config/mpv/scripts/
+cp dist/darwin-arm64/plugin/libmpv_stt_plugin.dylib ~/.config/mpv/scripts/
 ```
+
+> Linux / Windows 若从 dist 分发,把 `dist/<平台>/runtime/` 里的 FFmpeg 库一起带上;
+> Windows 需放到 DLL 搜索路径(mpv.exe 同目录或 PATH)。
 
 ### 配置
 

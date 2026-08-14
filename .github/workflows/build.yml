@@ -21,15 +21,11 @@ jobs:
             platform: darwin-arm64
             target: aarch64-apple-darwin
             artifact: libmpv_stt_plugin.dylib
-          # Windows is best-effort: ffmpeg's static source build on MSVC is
-          # unverified. A failure here is reported without blocking other
-          # platforms.
           - os: windows-latest
             platform: windows-x86_64
             target: x86_64-pc-windows-msvc
             artifact: mpv_stt_plugin.dll
     runs-on: ${{ matrix.os }}
-    continue-on-error: ${{ matrix.platform == 'windows-x86_64' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -39,83 +35,25 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang make nasm pkg-config
+          sudo apt-get install -y clang make pkg-config
 
+      # macOS links dynamically against brew FFmpeg (no source compile); the
+      # plugin's runtime deps are the brew dylibs themselves.
       - name: Install system deps (macOS)
         if: runner.os == 'macOS'
-        run: brew install nasm
+        run: brew install ffmpeg
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      # ffmpeg-sys-next's static source build needs cl.exe on PATH with the
-      # MSVC INCLUDE/LIB env; bash steps don't get that by default.
+      # bash steps don't get the MSVC INCLUDE/LIB env by default. FFmpeg itself
+      # is not compiled here — build-all.sh downloads a prebuilt win64 shared
+      # package and links it dynamically — so this is the only Windows setup.
       - name: Set up MSVC environment
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
-
-      # The Build step runs under Git Bash, which prepends its own /usr/bin
-      # (coreutils) to PATH on startup — that shadows MSVC's link.exe with
-      # Git's link.exe, and rustc fails with "link.exe returned an unexpected
-      # error". Point cargo at the real MSVC linker by full path instead.
-      - name: Point cargo at the MSVC linker
-        if: runner.os == 'Windows'
-        shell: bash
-        run: |
-          vc="${VCToolsInstallDir//\\//}"
-          vc="${vc%/}"
-          test -f "${vc}/bin/Hostx64/x64/link.exe" || {
-            echo "MSVC link.exe not found (VCToolsInstallDir=${VCToolsInstallDir:-unset})" >&2
-            exit 1
-          }
-          echo "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=${vc}/bin/Hostx64/x64/link.exe" >> "$GITHUB_ENV"
-
-      # ffmpeg's configure builds MSVC .d dependency files one of two ways:
-      # the old one pipes cl.exe's -showIncludes output through an awk program
-      # containing `gsub(/\\/, "/")`, which make/MSYS mangles into an awk
-      # syntax error on Windows (ffmpeg Trac #9043); the fixed one runs the
-      # paths through `wslpath -u`, but is only selected when `wslpath` exists
-      # on PATH. windows-latest has none, so provide a shim that performs the
-      # same Windows→unix conversion with cygpath (bundled with Git for
-      # Windows), and ffmpeg's configure takes its own fixed code path.
-      #
-      # The shim must also defend the second failure mode: ffmpeg's dep-rule
-      # calls `xargs -r -d\n -n1 wslpath -u`, and make/MSYS eats the backslash
-      # of `-d\n` so xargs splits on the literal letter 'n', truncating every
-      # path at its first 'n' (e.g. .../mpv_stt_plugin_crates → .../mpv_stt_plugi).
-      # A truncated path would be written into the .d file and make dies with
-      # "No rule to make target". Only emitting paths that actually exist (or
-      # nothing, giving the .d an empty dep list) keeps the build correct.
-      - name: Provide wslpath shim for ffmpeg (fixes MSVC dep awk + xargs)
-        if: runner.os == 'Windows'
-        shell: bash
-        run: |
-          mkdir -p "$RUNNER_TEMP/bin"
-          cat > "$RUNNER_TEMP/bin/wslpath" <<'EOF'
-          #!/usr/bin/env bash
-          # Minimal wslpath replacement for ffmpeg's MSVC dependency generation:
-          # ffmpeg invokes `wslpath -u <path>` per cl.exe -showIncludes line.
-          # Emit a converted path only when it names an existing file, so a
-          # path mangled by the -d\n→-dn xargs truncation cannot inject a bogus
-          # make target into the .d file.
-          mode="-u"
-          for arg in "$@"; do
-              case "$arg" in
-                  -a|-u|-m|-w|-p|-r|-s|-i) mode="$arg" ;;
-                  *)
-                      # Skip empties and tokens that don't look like paths.
-                      if [[ -n "$arg" ]] && { [[ "$arg" == *:* ]] || [[ "$arg" == /* ]]; }; then
-                          out="$(cygpath "$mode" "$arg" 2>/dev/null)" || continue
-                          [[ -n "$out" && -e "$out" ]] && echo "$out"
-                      fi
-                      ;;
-              esac
-          done
-          EOF
-          chmod +x "$RUNNER_TEMP/bin/wslpath"
-          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
 
       - name: Build (${{ matrix.platform }})
         shell: bash
@@ -124,15 +62,7 @@ jobs:
             echo "=== dist/build.log (tail 400) ===";
             tail -n 400 dist/build.log || true;
             echo "=== error-ish lines in dist/build.log ===";
-            grep -nE "error|Error|failed|Failed|cannot|not found|panic|✗|Argument list" dist/build.log | tail -n 60 || true;
-            if [[ "${{ matrix.platform }}" == "windows-x86_64" ]]; then
-              echo "=== toolchain ===";
-              which -a cl link 2>/dev/null || true;
-              echo "INCLUDE=$INCLUDE";
-              echo "LIB=$LIB";
-              echo "=== ffmpeg config.log ===";
-              find target -name config.log -path '*ffbuild*' -exec sh -c 'echo "--- $1 ---"; tail -n 50 "$1"' _ {} \; || true;
-            fi
+            grep -nE "error|Error|failed|Failed|cannot|not found|panic|✗" dist/build.log | tail -n 60 || true;
             exit 1;
           }
 
@@ -143,6 +73,7 @@ jobs:
           name: dist-${{ matrix.platform }}
           path: |
             dist/${{ matrix.platform }}/plugin/${{ matrix.artifact }}
+            dist/${{ matrix.platform }}/runtime/
             dist/MANIFEST.txt
             dist/build.log
 
