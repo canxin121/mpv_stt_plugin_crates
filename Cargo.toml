@@ -47,7 +47,7 @@ wait-timeout = "0.2.1"
 # Concurrency
 parking_lot = "0.12.5"
 
-# mpv C API (bindgen-only crate; header cloned by scripts/setup-deps.sh)
+# mpv C API (bindgen-only crate; header cloned by scripts/build-all.sh)
 mpv-client = "1.1.0"
 
 libc = "0.2.178"
@@ -87,6 +87,14 @@ ffmpeg-next = { path = "third_party/rust-ffmpeg" }
 default = ["stt_ferrum", "stt_openai"]
 stt_ferrum = ["dep:hex", "dep:opusic-sys"]
 stt_openai = []
+
+# mpv-client-sys's bindgen output types the mpv_format alias as i32 on Windows
+# (MSVC C enums default to int) but u32 elsewhere; upstream mpv-client hardcodes
+# u32, so it fails to compile on Windows. Our fork (third_party/mpv-client)
+# types the Format consts as ffi::mpv_format, which matches every platform.
+[patch.crates-io]
+mpv-client = { path = "third_party/mpv-client/mpv-client" }
+mpv-client-sys = { path = "third_party/mpv-client/mpv-client-sys" }
 
 [profile.release]
 opt-level = 3

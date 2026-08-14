@@ -665,6 +665,11 @@ build_desktop() {
     if [[ "${platform}" == windows-* ]]; then
         export FFMPEG_MARCH=""
         export FFMPEG_MTUNE=""
+        # ffmpeg's make step runs awk programs that contain backslashes
+        # (e.g. gsub(/\\/, "/")); MSYS/git-bash rewrites arguments containing
+        # backslashes before exec, corrupting them into awk syntax errors.
+        # Disable MSYS argument conversion for the whole build.
+        export MSYS2_ARG_CONV_EXCL="*"
     else
         unset FFMPEG_MARCH FFMPEG_MTUNE
     fi

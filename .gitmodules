@@ -1,3 +1,6 @@
 [submodule "third_party/rust-ffmpeg"]
 	path = third_party/rust-ffmpeg
 	url = https://github.com/canxin121/rust-ffmpeg.git
+[submodule "third_party/mpv-client"]
+	path = third_party/mpv-client
+	url = https://github.com/canxin121/mpv-client.git
