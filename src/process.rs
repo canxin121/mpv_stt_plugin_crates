@@ -1,4 +1,4 @@
-use mpv_stt_common::{MpvSttError, Result};
+use crate::common::{MpvSttError, Result};
 use std::process::{Command, Output, Stdio};
 use std::time::Duration;
 use wait_timeout::ChildExt;

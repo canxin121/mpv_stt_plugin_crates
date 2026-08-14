@@ -1,0 +1,106 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  desktop:
+    name: ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux-x86_64
+            target: x86_64-unknown-linux-gnu
+            artifact: libmpv_stt_plugin.so
+          - os: macos-latest
+            platform: darwin-arm64
+            target: aarch64-apple-darwin
+            artifact: libmpv_stt_plugin.dylib
+          # Windows is best-effort: ffmpeg's static source build on MSVC is
+          # unverified. A failure here is reported without blocking other
+          # platforms.
+          - os: windows-latest
+            platform: windows-x86_64
+            target: x86_64-pc-windows-msvc
+            artifact: mpv_stt_plugin.dll
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.platform == 'windows-x86_64' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install system deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang make nasm pkg-config
+
+      - name: Install system deps (macOS)
+        if: runner.os == 'macOS'
+        run: brew install nasm
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build (${{ matrix.platform }})
+        shell: bash
+        run: ./scripts/build-all.sh -p ${{ matrix.platform }}
+
+      - name: Upload artifacts
+        if: ${{ !cancelled() && !failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.platform }}
+          path: |
+            dist/${{ matrix.platform }}/plugin/${{ matrix.artifact }}
+            dist/MANIFEST.txt
+
+  android:
+    name: android (arm64-v8a, armeabi-v7a)
+    runs-on: ubuntu-latest
+    env:
+      ANDROID_NDK_HOME: ${{ github.workspace }}/target/android-ndk-r29
+      NDK: ${{ github.workspace }}/target/android-ndk-r29
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang make nasm pkg-config cmake meson ninja-build
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi
+
+      - name: Download Android NDK r29
+        run: |
+          mkdir -p "${{ github.workspace }}/target"
+          curl -fsSL -o /tmp/android-ndk.zip \
+            https://dl.google.com/android/repository/android-ndk-r29-linux.zip
+          unzip -q /tmp/android-ndk.zip -d "${{ github.workspace }}/target"
+          mv "${{ github.workspace }}/target/android-ndk-r29" \
+             "$ANDROID_NDK_HOME"
+
+      - name: Build (android)
+        run: ./scripts/build-all.sh -p android -a arm64-v8a,armeabi-v7a
+
+      - name: Upload artifacts
+        if: ${{ !cancelled() && !failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-android
+          path: |
+            dist/android/**/plugin/*.so
+            dist/MANIFEST.txt

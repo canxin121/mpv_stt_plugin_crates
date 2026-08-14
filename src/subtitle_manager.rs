@@ -1,6 +1,6 @@
 use log::{debug, trace};
-use mpv_stt_common::Result;
-use mpv_stt_srt::{SrtFile, SubtitleEntry, Timestamp};
+use crate::common::Result;
+use crate::srt::{SrtFile, SubtitleEntry, Timestamp};
 use std::collections::BTreeMap;
 use std::path::Path;
 

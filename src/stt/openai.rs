@@ -1,7 +1,7 @@
 use super::{BackendKind, SttBackend, SttDeviceNotice};
 use log::{debug, trace};
-use mpv_stt_common::{MpvSttError, Result};
-use mpv_stt_srt::{SrtFile, SubtitleEntry, Timestamp};
+use crate::common::{MpvSttError, Result};
+use crate::srt::{SrtFile, SubtitleEntry, Timestamp};
 use reqwest::blocking::multipart::{Form, Part};
 use reqwest::blocking::Client;
 use serde::Deserialize;

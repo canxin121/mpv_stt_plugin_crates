@@ -1,8 +1,8 @@
 use super::{BackendKind, SttBackend, SttDeviceNotice};
 use log::{debug, trace};
-use mpv_stt_common::{MpvSttError, Result};
-use mpv_stt_crypto::{AuthToken, EncryptionKey};
-use mpv_stt_srt::SrtFile;
+use crate::common::{MpvSttError, Result};
+use crate::crypto::{AuthToken, EncryptionKey};
+use crate::srt::SrtFile;
 use opusic_sys as opus;
 use reqwest::blocking::Client;
 use reqwest::header::{HeaderMap, HeaderValue};

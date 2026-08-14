@@ -2,7 +2,6 @@ use crate::audio::AudioExtractor;
 use crate::config::TranslateBackendKind;
 use crate::translate::{Translator, TranslatorConfig};
 use log::{debug, error};
-use mpv_stt_srt;
 use parking_lot::Mutex;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
@@ -212,7 +211,7 @@ pub extern "C" fn offset_srt(
             None => return -1,
         };
 
-        match mpv_stt_srt::offset_srt_file(&input, &output, offset_ms) {
+        match crate::srt::offset_srt_file(&input, &output, offset_ms) {
             Ok(_) => 0,
             Err(e) => {
                 error!("SRT offset error: {}", e);

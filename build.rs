@@ -54,4 +54,10 @@ fn main() {
         println!("cargo:rustc-link-arg=-undefined");
         println!("cargo:rustc-link-arg=dynamic_lookup");
     }
+
+    // Windows mirrors the macOS behaviour: mpv provides the symbols at load time,
+    // so force the linker to accept unresolved externals in the .dll.
+    if target.contains("windows") {
+        println!("cargo:rustc-link-arg=/FORCE:UNRESOLVED");
+    }
 }

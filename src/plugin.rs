@@ -16,8 +16,8 @@ use crate::config::Config;
 use crate::stt::{SttBackend, SttRunner};
 use crate::subtitle_manager::SubtitleManager;
 use crate::translate::{AsyncTranslationQueue, TranslationTask, TranslatorConfig};
-use mpv_stt_common::MpvSttError;
-use mpv_stt_srt::{self, SrtFile};
+use crate::common::MpvSttError;
+use crate::srt::SrtFile;
 
 struct TempPaths {
     _dir: TempDir,
@@ -844,7 +844,7 @@ impl PluginState {
         }
 
         if let Err(e) =
-            mpv_stt_srt::offset_srt_file(&append_srt, &offset_srt, self.current_pos_ms as i64)
+            crate::srt::offset_srt_file(&append_srt, &offset_srt, self.current_pos_ms as i64)
         {
             error!("SRT offset failed: {}", e);
             return false;
@@ -959,9 +959,9 @@ impl PluginState {
         }
     }
 
-    fn timestamp_to_millis(ts: mpv_stt_srt::Timestamp) -> u32 {
+    fn timestamp_to_millis(ts: crate::srt::Timestamp) -> u32 {
         let (h, m, s, ms) = ts.get();
-        mpv_stt_srt::Timestamp::convert_to_milliseconds(h, m, s, ms)
+        crate::srt::Timestamp::convert_to_milliseconds(h, m, s, ms)
     }
 
     fn save_subs(&mut self, client: &mut Handle, main_srt: &Path) -> bool {

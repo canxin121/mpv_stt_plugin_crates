@@ -4,7 +4,7 @@ use ffmpeg::util::mathematics::rescale;
 use ffmpeg::util::mathematics::rescale::Rescale;
 use ffmpeg_next as ffmpeg;
 use log::{debug, trace};
-use mpv_stt_common::{MpvSttError, Result};
+use crate::common::{MpvSttError, Result};
 use std::path::Path;
 use std::sync::{
     Arc, OnceLock,

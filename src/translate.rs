@@ -1,8 +1,8 @@
 use crate::config::TranslateBackendKind;
 use futures::stream::StreamExt;
 use log::{debug, trace, warn};
-use mpv_stt_common::{MpvSttError, Result};
-use mpv_stt_srt::SrtFile;
+use crate::common::{MpvSttError, Result};
+use crate::srt::SrtFile;
 use std::path::Path;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{

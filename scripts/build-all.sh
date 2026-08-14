@@ -80,6 +80,12 @@ host_tag() {
     esac
 }
 
+# Rust host triple of the current machine (used to skip --target for native
+# builds, which is required for ffmpeg's static source build).
+host_rust_target() {
+    rustc -vV 2>/dev/null | sed -n 's/^host: //p'
+}
+
 ensure_mpv_prefix() {
     local arch="$1"
     local builder_dir="$2"
@@ -228,27 +234,31 @@ log()  { log_core "${GREEN}" "$*"; }
 warn() { log_core "${YELLOW}[WARN]" "$*"; }
 error(){ log_core "${RED}[ERROR]" "$*"; }
 
-# Platform configurations
+# Platform configurations (single .so per platform/ABI, both STT backends are
+# compiled in via default features and picked at runtime via config.stt.backend).
 declare -A TARGETS=(
     ["linux-x86_64"]="x86_64-unknown-linux-gnu"
+    ["darwin-arm64"]="aarch64-apple-darwin"
+    ["darwin-x86_64"]="x86_64-apple-darwin"
+    ["windows-x86_64"]="x86_64-pc-windows-msvc"
 )
 
 # Android ABI configurations (details resolved via android_abi_spec in setup-deps)
 SUPPORTED_ANDROID_ABIS=("arm64-v8a" "armeabi-v7a" "x86" "x86_64")
 DEFAULT_ANDROID_ABIS=("arm64-v8a" "armeabi-v7a")
 
-# Feature configurations (plugin is a pure remote client; both backends are
-# compiled in by default and the active one is chosen at runtime via config).
+# Feature configurations. The plugin is a pure remote client; both backends are
+# compiled in by default (single .so, runtime switch). `-f` selects a
+# single-backend build (--no-default-features) — an optional override.
 PLUGIN_FEATURES=("stt_ferrum" "stt_openai")
 
 # CLI selections (populated by parse_args)
 SELECTED_PLATFORMS=()
-SELECTED_CRATES=()
 SELECTED_FEATURES=()
 SELECTED_ANDROID_ABIS=()
 CLEAN_DIST=0
 SHOW_MATRIX=0
-LINUX_PLATFORMS=()
+DESKTOP_PLATFORMS=()
 DO_ANDROID=0
 BUILD_MODE="build" # or "check"
 
@@ -258,10 +268,15 @@ Usage: ./scripts/build-all.sh [options]
 
 Build the mpv STT plugin across platforms. Defaults to the full matrix.
 
+One artifact per platform/ABI (both STT backends compiled in, switched at
+runtime via config.stt.backend); pass -f for a single-backend build.
+
 Options:
-  -p, --platform   <list>   Comma-separated platforms (linux-x86_64, android)
-  -c, --crate      <list>   Comma-separated crates (mpv-stt-plugin)
-  -f, --feature    <list>   Comma-separated features to build
+  -p, --platform   <list>   Comma-separated platforms (linux-x86_64, darwin-arm64,
+                            darwin-x86_64, windows-x86_64, android)
+  -f, --feature    <list>   Optional single-backend build: comma-separated features
+                            (stt_ferrum, stt_openai). Omit to build both backends in
+                            one .so (default).
   -a, --abi        <list>   Comma-separated Android ABIs (arm64-v8a, armeabi-v7a, x86, x86_64)
       --check               Run cargo check instead of building artifacts
       --clean               Remove dist/ before building (default: keep)
@@ -269,19 +284,23 @@ Options:
   -h, --help               Show this help and exit
 
 Examples:
-  # Only build Linux plugin with the OpenAI backend
-  ./scripts/build-all.sh -p linux-x86_64 -c mpv-stt-plugin -f stt_openai
+  # Full matrix (default): one libmpv_stt_plugin.so per platform/ABI, both backends
+  ./scripts/build-all.sh
 
-  # Build Android arm64 & armv7 with the OpenAI backend only (ferrum needs
-  # libopus cross-compile, not yet wired for Android)
-  ./scripts/build-all.sh -p android -a arm64-v8a,armeabi-v7a -f stt_openai
+  # Single platform (e.g. the current macOS host)
+  ./scripts/build-all.sh -p darwin-arm64
+
+  # Single-backend build (OpenAI only)
+  ./scripts/build-all.sh -p darwin-arm64 -f stt_openai
+
+  # Android arm64 & armv7 (needs NDK; ferrum pulls opusic-sys cross-compile)
+  ./scripts/build-all.sh -p android -a arm64-v8a,armeabi-v7a
 EOUSAGE
 }
 
 print_supported() {
     echo "Supported platforms : ${!TARGETS[*]} android"
-    echo "Supported crates    : mpv-stt-plugin"
-    echo "Plugin features     : ${PLUGIN_FEATURES[*]}"
+    echo "Plugin features     : ${PLUGIN_FEATURES[*]} (omit -f to build both in one .so)"
     echo "Android ABIs        : ${SUPPORTED_ANDROID_ABIS[*]}"
 }
 
@@ -314,11 +333,6 @@ parse_args() {
                 append_list SELECTED_PLATFORMS "$2"
                 shift 2
                 ;;
-            -c|--crate)
-                [[ $# -lt 2 ]] && { echo "ERROR: --crate requires a value" >&2; exit 1; }
-                append_list SELECTED_CRATES "$2"
-                shift 2
-                ;;
             -f|--feature)
                 [[ $# -lt 2 ]] && { echo "ERROR: --feature requires a value" >&2; exit 1; }
                 append_list SELECTED_FEATURES "$2"
@@ -326,18 +340,18 @@ parse_args() {
                 ;;
             -a|--abi)
                 [[ $# -lt 2 ]] && { echo "ERROR: --abi requires a value" >&2; exit 1; }
-        append_list SELECTED_ANDROID_ABIS "$2"
-        shift 2
-        ;;
-        --check)
-            BUILD_MODE="check"
-            CLEAN_DIST=0
-            shift
-            ;;
-        --clean)
-            CLEAN_DIST=1
-            shift
-            ;;
+                append_list SELECTED_ANDROID_ABIS "$2"
+                shift 2
+                ;;
+            --check)
+                BUILD_MODE="check"
+                CLEAN_DIST=0
+                shift
+                ;;
+            --clean)
+                CLEAN_DIST=1
+                shift
+                ;;
             -l|--list|--matrix)
                 SHOW_MATRIX=1
                 shift
@@ -359,15 +373,11 @@ set_defaults() {
     if [[ ${#SELECTED_PLATFORMS[@]} -eq 0 ]]; then
         SELECTED_PLATFORMS=("${!TARGETS[@]}" "android")
     fi
-    if [[ ${#SELECTED_CRATES[@]} -eq 0 ]]; then
-        SELECTED_CRATES=("mpv-stt-plugin")
-    fi
     if [[ ${#SELECTED_ANDROID_ABIS[@]} -eq 0 ]]; then
         SELECTED_ANDROID_ABIS=("${DEFAULT_ANDROID_ABIS[@]}")
     fi
 
     dedup_array SELECTED_PLATFORMS
-    dedup_array SELECTED_CRATES
     dedup_array SELECTED_FEATURES
     dedup_array SELECTED_ANDROID_ABIS
 }
@@ -390,13 +400,6 @@ validate_inputs() {
         fi
     done
 
-    for c in "${SELECTED_CRATES[@]}"; do
-        case "$c" in
-            mpv-stt-plugin) ;;
-            *) echo "ERROR: Unknown crate '${c}'" >&2; ok=0 ;;
-        esac
-    done
-
     for a in "${SELECTED_ANDROID_ABIS[@]}"; do
         if ! is_supported_android_abi "$a"; then
             echo "ERROR: Unknown Android ABI '${a}'" >&2
@@ -404,10 +407,9 @@ validate_inputs() {
         fi
     done
 
-    local all_features=("${PLUGIN_FEATURES[@]}")
     for f in "${SELECTED_FEATURES[@]}"; do
         local found=0
-        for af in "${all_features[@]}"; do
+        for af in "${PLUGIN_FEATURES[@]}"; do
             if [[ "$af" == "$f" ]]; then
                 found=1
                 break
@@ -425,14 +427,14 @@ validate_inputs() {
 }
 
 compute_platforms() {
-    LINUX_PLATFORMS=()
+    DESKTOP_PLATFORMS=()
     DO_ANDROID=0
 
     for p in "${SELECTED_PLATFORMS[@]}"; do
         if [[ "$p" == "android" ]]; then
             DO_ANDROID=1
         elif [[ -n "${TARGETS[$p]:-}" ]]; then
-            LINUX_PLATFORMS+=("$p")
+            DESKTOP_PLATFORMS+=("$p")
         fi
     done
 }
@@ -447,35 +449,21 @@ describe_array() {
     fi
 }
 
-get_features() {
-    local crate="$1"
-    local out_var="$2"
+# Build spec: with no -f we build default features (both backends, one .so);
+# with -f we build --no-default-features --features X per selected feature.
+get_build_specs() {
+    local out_var="$1"
     local -n out="$out_var"
-
-    local allowed_ref="PLUGIN_FEATURES"
-
-    local -n allowed="$allowed_ref"
     out=()
 
     if [[ ${#SELECTED_FEATURES[@]} -eq 0 ]]; then
-        out=("${allowed[@]}")
+        out+=("")
         return
     fi
 
     for f in "${SELECTED_FEATURES[@]}"; do
-        local matched=0
-        for a in "${allowed[@]}"; do
-            if [[ "$f" == "$a" ]]; then
-                matched=1
-                break
-            fi
-        done
-        if [[ $matched -eq 1 ]]; then
-            out+=("$f")
-        fi
+        out+=("$f")
     done
-
-    dedup_array out
 }
 
 is_in_array() {
@@ -496,18 +484,36 @@ check_env() {
     fi
 }
 
-# Build Android plugin for a specific ABI using android-mpv toolchain helpers
+# Artifact filename for the single crate on a given rust target triple.
+artifact_name() {
+    local target="$1"
+    case "$target" in
+        *windows*)   echo "mpv_stt_plugin.dll" ;;
+        *apple*)     echo "libmpv_stt_plugin.dylib" ;;
+        *)           echo "libmpv_stt_plugin.so" ;;
+    esac
+}
+
+# Build Android plugin for a specific ABI using android-mpv toolchain helpers.
+# `spec` is empty (default, both backends) or a single feature (single-backend).
 build_android_abi() {
     local abi="$1"
-    local feature="$2"
+    local spec="$2"
 
-    local spec
-    if ! spec="$(android_abi_spec "$abi")"; then
+    local spec_desc
+    if [[ -n "${spec}" ]]; then
+        spec_desc="${spec}"
+    else
+        spec_desc="stt_ferrum,stt_openai"
+    fi
+
+    local abi_spec
+    if ! abi_spec="$(android_abi_spec "$abi")"; then
         error "Unknown Android ABI '${abi}'"
         return 1
     fi
 
-    IFS=":" read -r _abi arch rust_target clang_target <<<"${spec}"
+    IFS=":" read -r _abi arch rust_target clang_target <<<"${abi_spec}"
 
     # Prepare env + deps (builds mpv/ffmpeg prefix on demand via scripts/android-mpv)
     if ! setup_android_env "$abi"; then
@@ -515,19 +521,18 @@ build_android_abi() {
         return 1
     fi
 
-    log "Building mpv-stt-plugin [${feature}] for Android ${abi} (${rust_target})..."
+    log "Building mpv-stt-plugin [${spec_desc}] for Android ${abi} (${rust_target})..."
 
     local cargo_cmd="${BUILD_MODE}"
 
     local cargo_args=(
         "${cargo_cmd}"
         "--release"
-        "-p" "mpv-stt-plugin"
         "--target" "${rust_target}"
     )
 
-    if [[ -n "${feature}" ]]; then
-        cargo_args+=("--features" "${feature}" "--no-default-features")
+    if [[ -n "${spec}" ]]; then
+        cargo_args+=("--no-default-features" "--features" "${spec}")
     fi
 
     local sysroot_env="${ANDROID_SYSROOT:-}"
@@ -539,74 +544,70 @@ build_android_abi() {
     fi
 
     if "${env_prefix[@]}" cargo "${cargo_args[@]}" >> "${BUILD_LOG}" 2>&1; then
-        log "✓ mpv-stt-plugin [${feature}] for Android ${abi}"
+        log "✓ mpv-stt-plugin [${spec_desc}] for Android ${abi}"
 
         if [[ "${BUILD_MODE}" == "build" ]]; then
-            local feature_suffix="${feature}"
-
             local out_dir="${DIST_DIR}/android/${abi}/plugin"
             mkdir -p "${out_dir}"
             cp "${WORKSPACE_ROOT}/target/${rust_target}/release/libmpv_stt_plugin.so" \
-               "${out_dir}/libmpv_stt_plugin_${feature_suffix}.so"
+               "${out_dir}/libmpv_stt_plugin.so"
         fi
         return 0
     else
-        error "✗ mpv-stt-plugin [${feature}] for Android ${abi} (see ${BUILD_LOG})"
+        error "✗ mpv-stt-plugin [${spec_desc}] for Android ${abi} (see ${BUILD_LOG})"
         return 1
     fi
 }
 
-# Build a single configuration (Linux only)
-build_artifact() {
+# Build a single desktop (non-Android) platform. `spec` is empty (default, both
+# backends) or a single feature (single-backend build).
+build_desktop() {
     local platform="$1"
-    local crate="$2"
-    local feature="$3"
+    local spec="$2"
     local target="${TARGETS[$platform]}"
 
-    log "Building ${crate} [${feature}] for ${platform}..."
+    local spec_desc
+    if [[ -n "${spec}" ]]; then
+        spec_desc="${spec}"
+    else
+        spec_desc="stt_ferrum,stt_openai"
+    fi
+
+    log "Building mpv-stt-plugin [${spec_desc}] for ${platform} (${target})..."
 
     local cargo_cmd="${BUILD_MODE}"
     local cargo_args=(
         "${cargo_cmd}"
         "--release"
-        "-p" "${crate}"
         "--target" "${target}"
     )
 
-    if [[ -n "${feature}" ]]; then
-        cargo_args+=("--features" "${feature}" "--no-default-features")
+    if [[ -n "${spec}" ]]; then
+        cargo_args+=("--no-default-features" "--features" "${spec}")
+    fi
+
+    # ffmpeg's static source build needs a real native toolchain; warn loudly
+    # when cross-compiling a desktop target (CI builds each platform natively).
+    local host_triple
+    host_triple="$(host_rust_target)"
+    if [[ "${target}" != "${host_triple}" ]]; then
+        warn "Cross-compiling ${target} from host ${host_triple}; needs a matching linker/toolchain."
     fi
 
     if cargo "${cargo_args[@]}" >> "${BUILD_LOG}" 2>&1; then
-        log "✓ ${crate} [${feature}] for ${platform}"
+        log "✓ mpv-stt-plugin [${spec_desc}] for ${platform}"
+
+        if [[ "${BUILD_MODE}" == "build" ]]; then
+            local out_dir="${DIST_DIR}/${platform}/plugin"
+            mkdir -p "${out_dir}"
+            local art
+            art="$(artifact_name "${target}")"
+            cp "${WORKSPACE_ROOT}/target/${target}/release/${art}" "${out_dir}/${art}"
+        fi
         return 0
     else
-        error "✗ ${crate} [${feature}] for ${platform} (see ${BUILD_LOG})"
+        error "✗ mpv-stt-plugin [${spec_desc}] for ${platform} (see ${BUILD_LOG})"
         return 1
-    fi
-}
-
-# Copy artifacts to dist directory
-copy_artifact() {
-    local platform="$1"
-    local crate="$2"
-    local feature="$3"
-    local target="${TARGETS[$platform]}"
-
-    local src_dir="${WORKSPACE_ROOT}/target/${target}/release"
-    local dest_base="${DIST_DIR}/${platform}"
-
-    if [[ "${BUILD_MODE}" == "check" ]]; then
-        return 0
-    fi
-
-    if [[ "${crate}" == "mpv-stt-plugin" ]]; then
-        local src="${src_dir}/libmpv_stt_plugin.so"
-        local dest_dir="${dest_base}/plugin"
-        local feature_suffix="${feature}"
-
-        mkdir -p "${dest_dir}"
-        cp "${src}" "${dest_dir}/libmpv_stt_plugin_${feature_suffix}.so"
     fi
 }
 
@@ -668,12 +669,9 @@ generate_manifest() {
 ensure_targets() {
     log "Ensuring Rust targets are installed..."
 
-    for platform in "${LINUX_PLATFORMS[@]}"; do
+    for platform in "${DESKTOP_PLATFORMS[@]}"; do
         local target="${TARGETS[$platform]}"
-        if ! rustup target list | grep -q "${target} (installed)"; then
-            log "Installing target: ${target}"
-            rustup target add "${target}"
-        fi
+        ensure_rust_target "${target}"
     done
 
     if ((DO_ANDROID)); then
@@ -707,8 +705,7 @@ main() {
 
     log "==> Starting multi-platform build"
     log "Selected platforms : $(describe_array SELECTED_PLATFORMS "n/a")"
-    log "Selected crates    : $(describe_array SELECTED_CRATES "n/a")"
-    log "Selected features  : $(describe_array SELECTED_FEATURES "all")"
+    log "Selected features  : $(describe_array SELECTED_FEATURES "both backends")"
     log "Android ABIs       : $(describe_array SELECTED_ANDROID_ABIS "default")"
     log "Clean dist         : ${CLEAN_DIST}"
     log "Mode               : ${BUILD_MODE}"
@@ -716,57 +713,38 @@ main() {
     check_env
     ensure_targets
 
+    local specs=()
+    get_build_specs specs
+
     local total=0
     local success=0
     local failed=0
 
-    # Linux builds
-    for platform in "${LINUX_PLATFORMS[@]}"; do
-        for crate in "${SELECTED_CRATES[@]}"; do
-            local features=()
-            get_features "${crate}" features
-
-            if [[ ${#features[@]} -eq 0 ]]; then
-                warn "No valid features selected for ${crate}; skipping"
-                continue
+    # Desktop builds
+    for platform in "${DESKTOP_PLATFORMS[@]}"; do
+        for spec in "${specs[@]}"; do
+            ((total++)) || true
+            if build_desktop "${platform}" "${spec}"; then
+                ((success++)) || true
+            else
+                ((failed++)) || true
             fi
-
-            for feature in "${features[@]}"; do
-                ((total++)) || true
-                        if build_artifact "${platform}" "${crate}" "${feature}"; then
-                            [[ "${BUILD_MODE}" == "build" ]] && copy_artifact "${platform}" "${crate}" "${feature}"
-                            ((success++)) || true
-                        else
-                            ((failed++)) || true
-                        fi
-            done
         done
     done
 
     # Android builds
     if ((DO_ANDROID)); then
-        if ! is_in_array "mpv-stt-plugin" "${SELECTED_CRATES[@]}"; then
-            warn "Skipping Android builds: mpv-stt-plugin not selected"
-        else
-            log "Building Android targets..."
-            local android_features=()
-            get_features "mpv-stt-plugin" android_features
-
-            if [[ ${#android_features[@]} -eq 0 ]]; then
-                warn "No valid features selected for Android plugin; skipping"
-            else
-                for abi in "${SELECTED_ANDROID_ABIS[@]}"; do
-                    for feature in "${android_features[@]}"; do
-                        ((total++)) || true
-                        if build_android_abi "${abi}" "${feature}"; then
-                            ((success++)) || true
-                        else
-                            ((failed++)) || true
-                        fi
-                    done
-                done
-            fi
-        fi
+        log "Building Android targets..."
+        for abi in "${SELECTED_ANDROID_ABIS[@]}"; do
+            for spec in "${specs[@]}"; do
+                ((total++)) || true
+                if build_android_abi "${abi}" "${spec}"; then
+                    ((success++)) || true
+                else
+                    ((failed++)) || true
+                fi
+            done
+        done
     fi
 
     generate_manifest

@@ -1,5 +1,5 @@
 use crate::config::SttConfig;
-use mpv_stt_common::Result;
+use crate::common::Result;
 use std::path::Path;
 
 pub use crate::config::BackendKind;
@@ -72,7 +72,7 @@ impl SttRunner {
                 #[cfg(not(feature = "stt_ferrum"))]
                 {
                     let _ = cfg;
-                    Err(mpv_stt_common::MpvSttError::SttFailed(
+                    Err(crate::common::MpvSttError::SttFailed(
                         "stt_ferrum feature not enabled".to_string(),
                     ))
                 }
@@ -91,7 +91,7 @@ impl SttRunner {
                 #[cfg(not(feature = "stt_openai"))]
                 {
                     let _ = cfg;
-                    Err(mpv_stt_common::MpvSttError::SttFailed(
+                    Err(crate::common::MpvSttError::SttFailed(
                         "stt_openai feature not enabled".to_string(),
                     ))
                 }

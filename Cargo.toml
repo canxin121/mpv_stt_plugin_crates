@@ -1,18 +1,15 @@
-[workspace]
-resolver = "2"
-members = [
-    "crates/mpv-stt-common",
-    "crates/mpv-stt-crypto",
-    "crates/mpv-stt-srt",
-    "crates/mpv-stt-plugin",
-]
-
-[workspace.package]
+[package]
+name = "mpv-stt-plugin"
 version = "0.1.0"
 edition = "2024"
 authors = ["canxin121"]
+description = "MPV real-time subtitle plugin (pure remote client: ASR + translation via subtitle-gateway)"
+license = "MIT"
 
-[workspace.dependencies]
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
 # Error handling
 thiserror = "2.0.17"
 
@@ -20,7 +17,7 @@ thiserror = "2.0.17"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.148"
 
-# Crypto
+# Crypto (ferrum protocol AES-256-GCM / auth token)
 aes-gcm = "0.10.3"
 sha2 = "0.10.9"
 rand = "0.9.2"
@@ -29,21 +26,67 @@ rand = "0.9.2"
 log = "0.4.29"
 env_logger = "0.11.8"
 
-# Async runtime
-tokio = { version = "1.48.0", features = ["full"] }
+# Async runtime (translate.rs uses tokio::spawn + channels)
+tokio = { version = "1.48.0", features = ["rt", "net", "time"] }
 futures = "0.3.31"
 
 # Audio processing
 hound = "3.5.1"
 tempfile = "3.24.0"
 
-# SRT library
+# SRT subtitle files
 srtlib = "0.2.0"
 
-# Internal workspace crates
-mpv-stt-common = { path = "crates/mpv-stt-common" }
-mpv-stt-crypto = { path = "crates/mpv-stt-crypto" }
-mpv-stt-srt = { path = "crates/mpv-stt-srt" }
+# Config
+figment = { version = "0.10.19", features = ["env", "toml"] }
+directories = "6.0.0"
+
+# Process
+wait-timeout = "0.2.1"
+
+# Concurrency
+parking_lot = "0.12.5"
+
+# mpv C API (bindgen-only crate; header cloned by scripts/setup-deps.sh)
+mpv-client = "1.1.0"
+
+libc = "0.2.178"
+android_logger = "0.15.1"
+
+# stt_ferrum feature: Opus compression + AES encryption support
+hex = { version = "0.4", optional = true }
+opusic-sys = { version = "0.5.8", optional = true }
+
+# Non-optional: used by the DeepL/LibreTranslate-compatible remote translation
+# backends (always compiled in) as well as the stt_ferrum / stt_openai backends.
+reqwest = { version = "0.12.28", default-features = false, features = [
+    "blocking",
+    "json",
+    "multipart",
+    "rustls-tls",
+] }
+
+[build-dependencies]
+cc = "1.1.31"
+
+# Desktop: statically compile FFmpeg from source (needs git/make/clang/network).
+[target.'cfg(not(target_os = "android"))'.dependencies]
+ffmpeg-next = { path = "third_party/rust-ffmpeg", features = [
+    "build",
+    "static",
+    "software-resampling",
+] }
+
+# Android: dynamically link libffmpeg from the prebuilt prefix (FFMPEG_DIR).
+[target.'cfg(target_os = "android")'.dependencies]
+ffmpeg-next = { path = "third_party/rust-ffmpeg" }
+
+[features]
+# Pure remote client: both backends are compiled in, the active one is picked
+# at runtime via `config.stt.backend`.
+default = ["stt_ferrum", "stt_openai"]
+stt_ferrum = ["dep:hex", "dep:opusic-sys"]
+stt_openai = []
 
 [profile.release]
 opt-level = 3
@@ -51,4 +94,9 @@ lto = true
 codegen-units = 1
 strip = true
 
-[patch.crates-io]
+# NOTE: the vendored rust-ffmpeg submodule (third_party/rust-ffmpeg) is not
+# compatible with ffmpeg-sys-next 8.x as-is — its match arms / constant names
+# are stale (FF_PROFILE_* vs AV_PROFILE_*, missing 8.1 enum variants). It is
+# fixed in the fork (canxin121/rust-ffmpeg) and the submodule pointer tracks
+# that fix; see the submodule log. Cargo.lock is gitignored, so cargo picks the
+# latest compatible ffmpeg-sys-next 8.x automatically (do not pin).

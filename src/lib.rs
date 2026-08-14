@@ -1,9 +1,12 @@
 pub mod audio;
+pub mod common;
 pub mod config;
+pub mod crypto;
 pub mod ffi;
 pub mod plugin;
 pub mod process;
 pub mod stt;
+pub mod srt;
 pub mod subtitle_manager;
 pub mod translate;
 
@@ -11,9 +14,9 @@ pub use audio::AudioExtractor;
 pub use config::{
     BackendKind, Config, InferenceDevice, TranslateBackendKind, TranslateLibreTranslateConfig,
 };
-pub use mpv_stt_common::{MpvSttError, Result};
-pub use mpv_stt_crypto::{AuthToken, EncryptionKey};
-pub use mpv_stt_srt::{SrtFile, SubtitleEntry};
+pub use crate::common::{MpvSttError, Result};
+pub use crate::crypto::{AuthToken, EncryptionKey};
+pub use crate::srt::{SrtFile, SubtitleEntry};
 #[cfg(feature = "stt_ferrum")]
 pub use stt::SttFerrumConfig;
 #[cfg(feature = "stt_openai")]

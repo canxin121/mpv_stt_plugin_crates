@@ -1,5 +1,5 @@
 use log::{debug, trace};
-use mpv_stt_common::{MpvSttError, Result};
+use crate::common::{MpvSttError, Result};
 use srtlib::{Subtitle, Subtitles};
 use std::fmt;
 use std::fs;
