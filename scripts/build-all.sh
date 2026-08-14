@@ -202,10 +202,30 @@ setup_android_env() {
     export "CMAKE_SYSTEM_PROCESSOR_${target_env_var}"="${clang_target%%-*}"
 }
 
+# Windows/git-bash PATH fix. Git Bash prepends its own /usr/bin (which ships a
+# GNU link.exe) ahead of the MSVC bin dirs, so when cl.exe internally spawns
+# link.exe during ffmpeg configure's compile test, it gets Git's linker and
+# fails with "cl.exe is unable to create an executable file". Put the MSVC bin
+# dir first so both cl.exe's internal link step and cc-based build scripts use
+# the real MSVC linker. No-op when VCToolsInstallDir is unset (non-Windows).
+fixup_windows_path() {
+    if [[ -z "${VCToolsInstallDir:-}" ]]; then
+        return
+    fi
+    local vc_bin
+    vc_bin="${VCToolsInstallDir//\\//}/bin/Hostx64/x64"
+    if [[ -d "${vc_bin}" ]]; then
+        export PATH="${vc_bin}:${PATH}"
+        echo "[setup] Prepended MSVC bin to PATH: ${vc_bin}" >&2
+    fi
+}
+
 ensure_setup_env() {
     if [[ -n "${SETUP_ENV_DONE:-}" ]]; then
         return
     fi
+
+    fixup_windows_path
 
     local cache_dir="${WORKSPACE_ROOT}/target/mpv-headers"
     local repo="${MPV_REPO:-$MPV_REPO_DEFAULT}"
