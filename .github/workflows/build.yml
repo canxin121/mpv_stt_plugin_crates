@@ -80,6 +80,14 @@ jobs:
             tail -n 400 dist/build.log || true;
             echo "=== error-ish lines in dist/build.log ===";
             grep -nE "error|Error|failed|Failed|cannot|not found|panic|✗|Argument list" dist/build.log | tail -n 60 || true;
+            if [[ "${{ matrix.platform }}" == "windows-x86_64" ]]; then
+              echo "=== toolchain ===";
+              which -a cl link 2>/dev/null || true;
+              echo "INCLUDE=$INCLUDE";
+              echo "LIB=$LIB";
+              echo "=== ffmpeg config.log ===";
+              find target -name config.log -path '*ffbuild*' -exec sh -c 'echo "--- $1 ---"; tail -n 50 "$1"' _ {} \; || true;
+            fi
             exit 1;
           }
 
