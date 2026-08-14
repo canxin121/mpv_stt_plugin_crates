@@ -56,6 +56,22 @@ jobs:
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
 
+      # The Build step runs under Git Bash, which prepends its own /usr/bin
+      # (coreutils) to PATH on startup — that shadows MSVC's link.exe with
+      # Git's link.exe, and rustc fails with "link.exe returned an unexpected
+      # error". Point cargo at the real MSVC linker by full path instead.
+      - name: Point cargo at the MSVC linker
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          vc="${VCToolsInstallDir//\\//}"
+          vc="${vc%/}"
+          test -f "${vc}/bin/Hostx64/x64/link.exe" || {
+            echo "MSVC link.exe not found (VCToolsInstallDir=${VCToolsInstallDir:-unset})" >&2
+            exit 1
+          }
+          echo "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=${vc}/bin/Hostx64/x64/link.exe" >> "$GITHUB_ENV"
+
       - name: Build (${{ matrix.platform }})
         shell: bash
         run: |
