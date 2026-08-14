@@ -237,9 +237,9 @@ declare -A TARGETS=(
 SUPPORTED_ANDROID_ABIS=("arm64-v8a" "armeabi-v7a" "x86" "x86_64")
 DEFAULT_ANDROID_ABIS=("arm64-v8a" "armeabi-v7a")
 
-# Feature configurations
-PLUGIN_FEATURES=("stt_local_cpu" "stt_local_cuda" "stt_remote_http")
-SERVER_FEATURES=("stt_local_cpu" "stt_local_cuda")
+# Feature configurations (plugin is a pure remote client; both backends are
+# compiled in by default and the active one is chosen at runtime via config).
+PLUGIN_FEATURES=("stt_ferrum" "stt_openai")
 
 # CLI selections (populated by parse_args)
 SELECTED_PLATFORMS=()
@@ -256,11 +256,11 @@ usage() {
     cat <<'EOUSAGE'
 Usage: ./scripts/build-all.sh [options]
 
-Build the mpv STT plugin/server across platforms. Defaults to the full matrix.
+Build the mpv STT plugin across platforms. Defaults to the full matrix.
 
 Options:
   -p, --platform   <list>   Comma-separated platforms (linux-x86_64, android)
-  -c, --crate      <list>   Comma-separated crates (mpv-stt-plugin, mpv-stt-server)
+  -c, --crate      <list>   Comma-separated crates (mpv-stt-plugin)
   -f, --feature    <list>   Comma-separated features to build
   -a, --abi        <list>   Comma-separated Android ABIs (arm64-v8a, armeabi-v7a, x86, x86_64)
       --check               Run cargo check instead of building artifacts
@@ -269,19 +269,19 @@ Options:
   -h, --help               Show this help and exit
 
 Examples:
-  # Only build Linux plugin with remote feature
-  ./scripts/build-all.sh -p linux-x86_64 -c mpv-stt-plugin -f stt_remote_http
+  # Only build Linux plugin with the OpenAI backend
+  ./scripts/build-all.sh -p linux-x86_64 -c mpv-stt-plugin -f stt_openai
 
-  # Build Android arm64 & armv7 CPU feature only
-  ./scripts/build-all.sh -p android -a arm64-v8a,armeabi-v7a -f stt_local_cpu
+  # Build Android arm64 & armv7 with the OpenAI backend only (ferrum needs
+  # libopus cross-compile, not yet wired for Android)
+  ./scripts/build-all.sh -p android -a arm64-v8a,armeabi-v7a -f stt_openai
 EOUSAGE
 }
 
 print_supported() {
     echo "Supported platforms : ${!TARGETS[*]} android"
-    echo "Supported crates    : mpv-stt-plugin mpv-stt-server"
+    echo "Supported crates    : mpv-stt-plugin"
     echo "Plugin features     : ${PLUGIN_FEATURES[*]}"
-    echo "Server features     : ${SERVER_FEATURES[*]}"
     echo "Android ABIs        : ${SUPPORTED_ANDROID_ABIS[*]}"
 }
 
@@ -360,7 +360,7 @@ set_defaults() {
         SELECTED_PLATFORMS=("${!TARGETS[@]}" "android")
     fi
     if [[ ${#SELECTED_CRATES[@]} -eq 0 ]]; then
-        SELECTED_CRATES=("mpv-stt-plugin" "mpv-stt-server")
+        SELECTED_CRATES=("mpv-stt-plugin")
     fi
     if [[ ${#SELECTED_ANDROID_ABIS[@]} -eq 0 ]]; then
         SELECTED_ANDROID_ABIS=("${DEFAULT_ANDROID_ABIS[@]}")
@@ -392,7 +392,7 @@ validate_inputs() {
 
     for c in "${SELECTED_CRATES[@]}"; do
         case "$c" in
-            mpv-stt-plugin|mpv-stt-server) ;;
+            mpv-stt-plugin) ;;
             *) echo "ERROR: Unknown crate '${c}'" >&2; ok=0 ;;
         esac
     done
@@ -404,7 +404,7 @@ validate_inputs() {
         fi
     done
 
-    local all_features=("${PLUGIN_FEATURES[@]}" "${SERVER_FEATURES[@]}")
+    local all_features=("${PLUGIN_FEATURES[@]}")
     for f in "${SELECTED_FEATURES[@]}"; do
         local found=0
         for af in "${all_features[@]}"; do
@@ -452,12 +452,7 @@ get_features() {
     local out_var="$2"
     local -n out="$out_var"
 
-    local allowed_ref
-    if [[ "${crate}" == "mpv-stt-plugin" ]]; then
-        allowed_ref="PLUGIN_FEATURES"
-    else
-        allowed_ref="SERVER_FEATURES"
-    fi
+    local allowed_ref="PLUGIN_FEATURES"
 
     local -n allowed="$allowed_ref"
     out=()
@@ -531,7 +526,7 @@ build_android_abi() {
         "--target" "${rust_target}"
     )
 
-    if [[ "${feature}" != "stt_local_cpu" ]]; then
+    if [[ -n "${feature}" ]]; then
         cargo_args+=("--features" "${feature}" "--no-default-features")
     fi
 
@@ -547,12 +542,7 @@ build_android_abi() {
         log "✓ mpv-stt-plugin [${feature}] for Android ${abi}"
 
         if [[ "${BUILD_MODE}" == "build" ]]; then
-            local feature_suffix
-            case "${feature}" in
-                stt_local_cpu) feature_suffix="cpu" ;;
-                stt_remote_http) feature_suffix="remote" ;;
-                *) feature_suffix="${feature}" ;;
-            esac
+            local feature_suffix="${feature}"
 
             local out_dir="${DIST_DIR}/android/${abi}/plugin"
             mkdir -p "${out_dir}"
@@ -583,7 +573,7 @@ build_artifact() {
         "--target" "${target}"
     )
 
-    if [[ "${feature}" != "stt_local_cpu" ]]; then
+    if [[ -n "${feature}" ]]; then
         cargo_args+=("--features" "${feature}" "--no-default-features")
     fi
 
@@ -613,31 +603,10 @@ copy_artifact() {
     if [[ "${crate}" == "mpv-stt-plugin" ]]; then
         local src="${src_dir}/libmpv_stt_plugin.so"
         local dest_dir="${dest_base}/plugin"
-        local feature_suffix
-
-        case "${feature}" in
-            stt_local_cpu) feature_suffix="cpu" ;;
-            stt_local_cuda) feature_suffix="cuda" ;;
-            stt_remote_http) feature_suffix="remote" ;;
-            *) feature_suffix="${feature}" ;;
-        esac
+        local feature_suffix="${feature}"
 
         mkdir -p "${dest_dir}"
         cp "${src}" "${dest_dir}/libmpv_stt_plugin_${feature_suffix}.so"
-
-    elif [[ "${crate}" == "mpv-stt-server" ]]; then
-        local src="${src_dir}/mpv-stt-server"
-        local dest_dir="${dest_base}/server"
-        local feature_suffix
-
-        case "${feature}" in
-            stt_local_cpu) feature_suffix="cpu" ;;
-            stt_local_cuda) feature_suffix="cuda" ;;
-            *) feature_suffix="${feature}" ;;
-        esac
-
-        mkdir -p "${dest_dir}"
-        cp "${src}" "${dest_dir}/mpv-stt-server_${feature_suffix}"
     fi
 }
 
@@ -666,13 +635,6 @@ generate_manifest() {
             if [[ -d "${DIST_DIR}/${platform}/plugin" ]]; then
                 echo "  Plugin:"
                 for f in "${DIST_DIR}/${platform}/plugin"/*; do
-                    [[ -f "$f" ]] && echo "    - $(basename "$f") ($(du -h "$f" | cut -f1))"
-                done
-            fi
-
-            if [[ -d "${DIST_DIR}/${platform}/server" ]]; then
-                echo "  Server:"
-                for f in "${DIST_DIR}/${platform}/server"/*; do
                     [[ -f "$f" ]] && echo "    - $(basename "$f") ($(du -h "$f" | cut -f1))"
                 done
             fi
@@ -761,11 +723,6 @@ main() {
     # Linux builds
     for platform in "${LINUX_PLATFORMS[@]}"; do
         for crate in "${SELECTED_CRATES[@]}"; do
-            if [[ "${crate}" == "mpv-stt-server" && "${platform}" != "linux-x86_64" ]]; then
-                warn "Skipping ${crate} on ${platform} (not supported)"
-                continue
-            fi
-
             local features=()
             get_features "${crate}" features
 
@@ -800,11 +757,6 @@ main() {
             else
                 for abi in "${SELECTED_ANDROID_ABIS[@]}"; do
                     for feature in "${android_features[@]}"; do
-                        if [[ "${feature}" == "stt_local_cuda" ]]; then
-                            warn "Skipping feature ${feature} for Android (unsupported)"
-                            continue
-                        fi
-
                         ((total++)) || true
                         if build_android_abi "${abi}" "${feature}"; then
                             ((success++)) || true

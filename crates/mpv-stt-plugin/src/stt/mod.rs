@@ -1,24 +1,8 @@
-use crate::config::InferenceDevice;
+use crate::config::SttConfig;
 use mpv_stt_common::Result;
 use std::path::Path;
 
-/// Enumerates available speech-to-text backends.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BackendKind {
-    LocalModelCpu,
-    LocalModelCuda,
-    RemoteHttp,
-}
-
-impl std::fmt::Display for BackendKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            BackendKind::LocalModelCpu => write!(f, "local-model-cpu"),
-            BackendKind::LocalModelCuda => write!(f, "local-model-cuda"),
-            BackendKind::RemoteHttp => write!(f, "remote-http"),
-        }
-    }
-}
+pub use crate::config::BackendKind;
 
 /// Common trait for all speech-to-text backends.
 pub trait SttBackend: Send {
@@ -40,59 +24,121 @@ pub trait SttBackend: Send {
 
 #[derive(Debug, Clone)]
 pub struct SttDeviceNotice {
-    pub requested: InferenceDevice,
-    pub effective: InferenceDevice,
+    pub requested: crate::config::InferenceDevice,
+    pub effective: crate::config::InferenceDevice,
     pub reason: String,
     pub gpu_device: i32,
 }
 
-// Enforce exactly one backend at compile time.
-#[cfg(not(any(
-    feature = "stt_local_cpu",
-    feature = "stt_local_cuda",
-    feature = "stt_remote_http"
-)))]
-compile_error!(
-    "No STT backend selected. Enable exactly one of: stt_local_cpu, stt_local_cuda, stt_remote_http"
-);
+// Backend modules. Both remote backends are compiled in (the plugin is a pure
+// remote client); the active one is chosen at runtime via `config.stt.backend`.
+#[cfg(feature = "stt_ferrum")]
+mod ferrum;
 
-#[cfg(any(
-    all(feature = "stt_local_cpu", feature = "stt_local_cuda"),
-    all(feature = "stt_local_cpu", feature = "stt_remote_http"),
-    all(feature = "stt_local_cuda", feature = "stt_remote_http")
-))]
-compile_error!("Cannot enable multiple STT backends simultaneously");
-
-#[cfg(all(target_os = "android", feature = "stt_local_cuda"))]
-compile_error!("Android does not support the stt_local_cuda backend");
-
-// Backend modules
-#[cfg(any(feature = "stt_local_cpu", feature = "stt_local_cuda"))]
-mod local_whisper;
-
-#[cfg(feature = "stt_remote_http")]
-mod remote_http;
-
-// Active backend type alias
-#[cfg(feature = "stt_local_cpu")]
-pub use local_whisper::LocalWhisperBackend as ActiveBackend;
-
-#[cfg(feature = "stt_local_cuda")]
-pub use local_whisper::LocalWhisperBackend as ActiveBackend;
-
-#[cfg(feature = "stt_remote_http")]
-pub use remote_http::RemoteHttpBackend as ActiveBackend;
+#[cfg(feature = "stt_openai")]
+mod openai;
 
 // Config exports
-#[cfg(any(feature = "stt_local_cpu", feature = "stt_local_cuda"))]
-pub use local_whisper::LocalModelConfig;
+#[cfg(feature = "stt_ferrum")]
+pub use ferrum::SttFerrumConfig;
 
-#[cfg(feature = "stt_remote_http")]
-pub use remote_http::RemoteSttConfig;
+#[cfg(feature = "stt_openai")]
+pub use openai::SttOpenAiConfig;
 
-// Convenience type alias (ergonomic only)
-#[cfg(any(feature = "stt_local_cpu", feature = "stt_local_cuda"))]
-pub type SttRunner = local_whisper::LocalWhisperBackend;
+/// Runtime-selected STT backend. Both remote backends are compiled in; which
+/// one actually runs is decided from `SttConfig::backend` at startup.
+pub enum SttRunner {
+    #[cfg(feature = "stt_ferrum")]
+    Ferrum(ferrum::FerrumBackend),
+    #[cfg(feature = "stt_openai")]
+    OpenAi(openai::OpenAiBackend),
+}
 
-#[cfg(feature = "stt_remote_http")]
-pub type SttRunner = remote_http::RemoteHttpBackend;
+impl SttRunner {
+    /// Build the active backend from the runtime config, matching `cfg.backend`.
+    pub fn from_config(cfg: &SttConfig) -> Result<Self> {
+        match cfg.backend {
+            BackendKind::Ferrum => {
+                #[cfg(feature = "stt_ferrum")]
+                {
+                    let ferrum_cfg = cfg
+                        .ferrum
+                        .as_ref()
+                        .expect("Missing [stt.ferrum] config for ferrum backend");
+                    Ok(SttRunner::Ferrum(ferrum::FerrumBackend::new(
+                        ferrum_cfg.clone(),
+                    )?))
+                }
+                #[cfg(not(feature = "stt_ferrum"))]
+                {
+                    let _ = cfg;
+                    Err(mpv_stt_common::MpvSttError::SttFailed(
+                        "stt_ferrum feature not enabled".to_string(),
+                    ))
+                }
+            }
+            BackendKind::OpenAi => {
+                #[cfg(feature = "stt_openai")]
+                {
+                    let openai_cfg = cfg
+                        .openai
+                        .as_ref()
+                        .expect("Missing [stt.openai] config for OpenAI backend");
+                    Ok(SttRunner::OpenAi(openai::OpenAiBackend::new(
+                        openai_cfg.clone(),
+                    )?))
+                }
+                #[cfg(not(feature = "stt_openai"))]
+                {
+                    let _ = cfg;
+                    Err(mpv_stt_common::MpvSttError::SttFailed(
+                        "stt_openai feature not enabled".to_string(),
+                    ))
+                }
+            }
+        }
+    }
+}
+
+impl SttBackend for SttRunner {
+    fn kind(&self) -> BackendKind {
+        match self {
+            #[cfg(feature = "stt_ferrum")]
+            SttRunner::Ferrum(b) => b.kind(),
+            #[cfg(feature = "stt_openai")]
+            SttRunner::OpenAi(b) => b.kind(),
+        }
+    }
+
+    fn transcribe<P: AsRef<Path>>(
+        &mut self,
+        audio_path: P,
+        output_prefix: P,
+        duration_ms: u64,
+    ) -> Result<()> {
+        match self {
+            #[cfg(feature = "stt_ferrum")]
+            SttRunner::Ferrum(b) => b.transcribe(audio_path, output_prefix, duration_ms),
+            #[cfg(feature = "stt_openai")]
+            SttRunner::OpenAi(b) => b.transcribe(audio_path, output_prefix, duration_ms),
+        }
+    }
+
+    fn cancel_inflight(&self) {
+        match self {
+            #[cfg(feature = "stt_ferrum")]
+            SttRunner::Ferrum(b) => b.cancel_inflight(),
+            #[cfg(feature = "stt_openai")]
+            SttRunner::OpenAi(b) => b.cancel_inflight(),
+        }
+    }
+
+    fn take_device_notice(&mut self) -> Option<SttDeviceNotice> {
+        match self {
+            #[cfg(feature = "stt_ferrum")]
+            SttRunner::Ferrum(b) => b.take_device_notice(),
+            #[cfg(feature = "stt_openai")]
+            SttRunner::OpenAi(b) => b.take_device_notice(),
+        }
+    }
+}

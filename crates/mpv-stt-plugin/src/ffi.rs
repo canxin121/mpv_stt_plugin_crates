@@ -1,8 +1,5 @@
 use crate::audio::AudioExtractor;
-#[cfg(any(feature = "stt_local_cpu", feature = "stt_local_cuda"))]
-use crate::stt::LocalModelConfig;
-#[cfg(any(feature = "stt_local_cpu", feature = "stt_local_cuda"))]
-use crate::stt::{SttBackend, SttRunner};
+use crate::config::TranslateBackendKind;
 use crate::translate::{Translator, TranslatorConfig};
 use log::{debug, error};
 use mpv_stt_srt;
@@ -13,17 +10,10 @@ use std::sync::OnceLock;
 
 // Global state for configuration
 static AUDIO_EXTRACTOR: OnceLock<Mutex<AudioExtractor>> = OnceLock::new();
-#[cfg(any(feature = "stt_local_cpu", feature = "stt_local_cuda"))]
-static WHISPER_RUNNER: OnceLock<Mutex<Option<SttRunner>>> = OnceLock::new();
 static TRANSLATOR: OnceLock<Mutex<Option<Translator>>> = OnceLock::new();
 
 fn audio_extractor() -> &'static Mutex<AudioExtractor> {
     AUDIO_EXTRACTOR.get_or_init(|| Mutex::new(AudioExtractor::default()))
-}
-
-#[cfg(any(feature = "stt_local_cpu", feature = "stt_local_cuda"))]
-fn whisper_runner() -> &'static Mutex<Option<SttRunner>> {
-    WHISPER_RUNNER.get_or_init(|| Mutex::new(None))
 }
 
 fn translator_state() -> &'static Mutex<Option<Translator>> {
@@ -46,39 +36,8 @@ fn string_to_c_str(s: String) -> *mut c_char {
     CString::new(s).unwrap_or_default().into_raw()
 }
 
-/// Initialize speech-to-text configuration (local model backends)
-#[cfg(any(feature = "stt_local_cpu", feature = "stt_local_cuda"))]
-#[unsafe(no_mangle)]
-pub extern "C" fn mpv_stt_plugin_rs_stt_init(
-    model_path: *const c_char,
-    threads: u8,
-    language: *const c_char,
-    _inference_device: i32,
-    gpu_device: i32,
-    flash_attn: bool,
-) -> i32 {
-    unsafe {
-        let model_path = match c_str_to_string(model_path) {
-            Some(s) => s,
-            None => return -1,
-        };
-
-        let language = c_str_to_string(language).unwrap_or_else(|| "auto".to_string());
-
-        let config = LocalModelConfig::new(model_path)
-            .with_threads(threads)
-            .with_language(language)
-            .with_gpu_device(gpu_device)
-            .with_flash_attn(flash_attn);
-
-        let runner = SttRunner::new(config);
-        *whisper_runner().lock() = Some(runner);
-        debug!("STT (local) initialized via FFI");
-        0
-    }
-}
-
-/// Initialize Translator configuration (builtin Google Translate only)
+/// Initialize Translator configuration (points at the default remote
+/// DeepL-compatible server on 127.0.0.1:8000, no API key).
 #[unsafe(no_mangle)]
 pub extern "C" fn translator_init(from_lang: *const c_char, to_lang: *const c_char) -> i32 {
     unsafe {
@@ -88,7 +47,61 @@ pub extern "C" fn translator_init(from_lang: *const c_char, to_lang: *const c_ch
         let config = TranslatorConfig::new(from_lang, to_lang);
         let translator = Translator::new(config);
         *translator_state().lock() = Some(translator);
-        debug!("Translator initialized via FFI (builtin Google Translate)");
+        debug!("Translator initialized via FFI (default remote DeepL-compatible server)");
+        0
+    }
+}
+
+/// Initialize Translator configuration with an explicit remote server and
+/// optional API key. Null pointers fall back to defaults.
+#[unsafe(no_mangle)]
+pub extern "C" fn translator_init_remote(
+    from_lang: *const c_char,
+    to_lang: *const c_char,
+    server_addr: *const c_char,
+    api_key: *const c_char,
+) -> i32 {
+    unsafe {
+        let from_lang = c_str_to_string(from_lang).unwrap_or_else(|| "auto".to_string());
+        let to_lang = c_str_to_string(to_lang).unwrap_or_else(|| "en".to_string());
+        let server_addr =
+            c_str_to_string(server_addr).unwrap_or_else(|| "http://127.0.0.1:8000".to_string());
+        let api_key = c_str_to_string(api_key).unwrap_or_default();
+
+        let config = TranslatorConfig::new(from_lang, to_lang)
+            .with_server_addr(server_addr)
+            .with_api_key(api_key);
+        let translator = Translator::new(config);
+        *translator_state().lock() = Some(translator);
+        debug!("Translator initialized via FFI (remote DeepL-compatible server)");
+        0
+    }
+}
+
+/// Initialize Translator configuration for the LibreTranslate protocol with an
+/// explicit remote server and optional API key (sent in the body as `api_key`).
+/// Null pointers fall back to defaults.
+#[unsafe(no_mangle)]
+pub extern "C" fn translator_init_libretranslate(
+    from_lang: *const c_char,
+    to_lang: *const c_char,
+    server_addr: *const c_char,
+    api_key: *const c_char,
+) -> i32 {
+    unsafe {
+        let from_lang = c_str_to_string(from_lang).unwrap_or_else(|| "auto".to_string());
+        let to_lang = c_str_to_string(to_lang).unwrap_or_else(|| "en".to_string());
+        let server_addr =
+            c_str_to_string(server_addr).unwrap_or_else(|| "http://127.0.0.1:8000".to_string());
+        let api_key = c_str_to_string(api_key).unwrap_or_default();
+
+        let config = TranslatorConfig::new(from_lang, to_lang)
+            .with_backend(TranslateBackendKind::LibreTranslate)
+            .with_libretranslate_server_addr(server_addr)
+            .with_libretranslate_api_key(api_key);
+        let translator = Translator::new(config);
+        *translator_state().lock() = Some(translator);
+        debug!("Translator initialized via FFI (remote LibreTranslate server)");
         0
     }
 }
@@ -117,44 +130,6 @@ pub extern "C" fn extract_audio(
             Ok(_) => 0,
             Err(e) => {
                 error!("Audio extraction error: {}", e);
-                -1
-            }
-        }
-    }
-}
-
-/// Run Whisper transcription
-#[cfg(any(feature = "stt_local_cpu", feature = "stt_local_cuda"))]
-#[unsafe(no_mangle)]
-pub extern "C" fn stt_transcribe(
-    audio_path: *const c_char,
-    output_prefix: *const c_char,
-    duration_ms: u64,
-) -> i32 {
-    unsafe {
-        let audio = match c_str_to_string(audio_path) {
-            Some(s) => s,
-            None => return -1,
-        };
-
-        let output = match c_str_to_string(output_prefix) {
-            Some(s) => s,
-            None => return -1,
-        };
-
-        let mut runner_guard = whisper_runner().lock();
-        let runner = match runner_guard.as_mut() {
-            Some(r) => r,
-            None => {
-                error!("Whisper not initialized");
-                return -1;
-            }
-        };
-
-        match runner.transcribe(&audio, &output, duration_ms) {
-            Ok(_) => 0,
-            Err(e) => {
-                error!("STT transcription error: {}", e);
                 -1
             }
         }

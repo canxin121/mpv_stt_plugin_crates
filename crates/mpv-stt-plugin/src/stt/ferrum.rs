@@ -14,13 +14,15 @@ use std::sync::{
 };
 use std::time::{Duration, Instant, SystemTime};
 
-pub type RemoteSttConfig = crate::config::SttRemoteHttpConfig;
+pub type SttFerrumConfig = crate::config::SttFerrumConfig;
 
 const HEADER_REQUEST_ID: &str = "x-request-id";
 const HEADER_DURATION_MS: &str = "x-duration-ms";
 const HEADER_AUTH_TOKEN: &str = "x-auth-token";
 const HEADER_COMPRESSION: &str = "x-compression";
 const HEADER_ENCRYPTED: &str = "x-encrypted";
+const HEADER_MODEL: &str = "x-model";
+const HEADER_LANGUAGE: &str = "x-language";
 const HEADER_QUEUE_MS: &str = "x-metric-queue-ms";
 const HEADER_INFER_MS: &str = "x-metric-infer-ms";
 const HEADER_WORKER_MS: &str = "x-metric-worker-ms";
@@ -31,8 +33,8 @@ const HEADER_BYTES_OUT: &str = "x-bytes-out";
 const COMPRESSION_PCM: &str = "pcm";
 const COMPRESSION_OPUS: &str = "opus";
 
-pub struct RemoteHttpBackend {
-    config: RemoteSttConfig,
+pub struct FerrumBackend {
+    config: SttFerrumConfig,
     server_url: String,
     cancel_generation: Arc<AtomicU64>,
     encryption_key: Option<EncryptionKey>,
@@ -40,8 +42,8 @@ pub struct RemoteHttpBackend {
     client: Client,
 }
 
-impl RemoteHttpBackend {
-    pub fn new(config: RemoteSttConfig) -> Result<Self> {
+impl FerrumBackend {
+    pub fn new(config: SttFerrumConfig) -> Result<Self> {
         let encryption_key = if config.enable_encryption {
             if config.encryption_key.is_empty() {
                 return Err(MpvSttError::SttFailed(
@@ -88,8 +90,11 @@ impl RemoteHttpBackend {
             .ok_or_else(|| MpvSttError::InvalidPath("Invalid audio path".to_string()))?;
 
         trace!(
-            "Remote HTTP STT: {} (duration: {}ms)",
-            audio_str, duration_ms
+            "Ferrum STT: {} (duration: {}ms, model: {}, language: {})",
+            audio_str,
+            duration_ms,
+            self.config.model,
+            self.config.language.as_deref().unwrap_or("auto")
         );
 
         let run_generation = self.cancel_generation.load(Ordering::Relaxed);
@@ -202,6 +207,18 @@ impl RemoteHttpBackend {
         if encrypted {
             headers.insert(HEADER_ENCRYPTED, HeaderValue::from_static("1"));
         }
+        headers.insert(
+            HEADER_MODEL,
+            HeaderValue::from_str(&self.config.model)
+                .map_err(|e| MpvSttError::SttFailed(format!("Header error: {}", e)))?,
+        );
+        if let Some(lang) = self.config.language.as_ref() {
+            headers.insert(
+                HEADER_LANGUAGE,
+                HeaderValue::from_str(lang)
+                    .map_err(|e| MpvSttError::SttFailed(format!("Header error: {}", e)))?,
+            );
+        }
 
         let wall_start = Instant::now();
         let response = self
@@ -251,10 +268,11 @@ impl RemoteHttpBackend {
         let server_non_infer_ms = server_worker_ms.saturating_sub(server_infer_ms);
 
         debug!(
-            "Remote HTTP req {} duration_ms={} wall={}ms net≈{}ms srv_queue={}ms srv_worker={}ms \
+            "Ferrum req {} duration_ms={} model={} wall={}ms net≈{}ms srv_queue={}ms srv_worker={}ms \
              srv_infer={}ms srv_non_infer={}ms bytes_out={}B bytes_in={}B srv_bytes_out={}B resp_raw={}B",
             request_id,
             duration_ms,
+            self.config.model,
             wall_ms,
             network_ms,
             server_queue_ms,
@@ -410,9 +428,9 @@ fn normalize_server_url(raw: &str) -> String {
     }
 }
 
-impl SttBackend for RemoteHttpBackend {
+impl SttBackend for FerrumBackend {
     fn kind(&self) -> BackendKind {
-        BackendKind::RemoteHttp
+        BackendKind::Ferrum
     }
 
     fn transcribe<P: AsRef<Path>>(

@@ -35,7 +35,6 @@ source ./scripts/setup-deps.fish
 
 Ready to build:
   cargo build --release -p mpv-stt-plugin
-  cargo build --release -p mpv-stt-server
 ```
 
 ---
@@ -94,7 +93,6 @@ source ./scripts/setup-deps.fish      # Fish
 
 # 2. 直接编译
 cargo build --release -p mpv-stt-plugin
-cargo build --release -p mpv-stt-server
 
 # 3. 安装
 cp target/release/libmpv_stt_plugin.so ~/.config/mpv/scripts/
@@ -165,8 +163,7 @@ source ./scripts/setup-deps.sh  # 或 .fish
 - `android-armv7` - Android ARMv7
 
 **支持 Features**：
-- 插件：`stt_local_cpu`, `stt_local_cuda`, `stt_remote_http`
-- 服务器：`stt_local_cpu`, `stt_local_cuda`
+- 插件：`stt_ferrum`, `stt_openai`（两者默认同时构建，运行时由 `[stt] backend` 选择）
 
 **使用方法**：
 
@@ -195,19 +192,12 @@ source ./scripts/setup-deps.sh   # 或 ./scripts/setup-deps.fish
 ```
 dist/
 ├── linux-x86_64/
-│   ├── plugin/
-│   │   ├── libmpv_stt_plugin_cpu.so
-│   │   ├── libmpv_stt_plugin_cuda.so
-│   │   └── libmpv_stt_plugin_remote.so
-│   └── server/
-│       ├── mpv-stt-server_cpu
-│       └── mpv-stt-server_cuda
+│   └── plugin/
+│       ├── libmpv_stt_plugin_ferrum.so
+│       └── libmpv_stt_plugin_openai.so
 ├── android-aarch64/
-│   ├── plugin/
-│   │   ├── libmpv_stt_plugin_cpu.so
-│   │   └── libmpv_stt_plugin_remote.so
-│   └── server/
-│       └── mpv-stt-server_cpu
+│   └── plugin/
+│       └── libmpv_stt_plugin_openai.so   # Android 仅 stt_openai
 ├── android-armv7/
 │   └── ...
 ├── MANIFEST.txt          # 产物清单
@@ -222,7 +212,7 @@ dist/
 - `ANDROID_FFMPEG_REPO` / `ANDROID_FFMPEG_BRANCH`: FFmpeg 源仓与分支/标签。
 
 **注意事项**：
-- Android 不支持 CUDA feature（自动跳过）
+- Android 仅构建 `stt_openai`（`stt_ferrum` 的 opusic-sys 未验证 Android 交叉编译，自动跳过）
 - 首次构建会自动安装所需的 Rust target（`rustup target add ...`）
 - 构建失败的任务会记录到 `dist/build.log`
 - 所有产物按平台和类型分类存放

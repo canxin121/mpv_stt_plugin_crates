@@ -9,13 +9,10 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 mpv-stt-common.workspace = true
 mpv-stt-crypto.workspace = true
-mpv-stt-protocol.workspace = true
 mpv-stt-srt.workspace = true
 
-thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-postcard.workspace = true
 figment = { version = "0.10.19", features = ["env", "toml"] }
 directories = "6.0.0"
 tempfile.workspace = true
@@ -24,15 +21,15 @@ parking_lot = "0.12.5"
 log.workspace = true
 env_logger.workspace = true
 mpv-client = "1.1.0"
-translators = { version = "0.1.5", features = ["google", "tokio-async"] }
-tokio = { version = "1.48.0", features = ["rt", "time"] }
-whisper-rs = { version = "0.15.1", optional = true }
+tokio = { version = "1.48.0", features = ["rt", "net", "time"] }
 hound.workspace = true
 libc = "0.2.178"
 futures.workspace = true
 android_logger = "0.15.1"
 hex = { version = "0.4", optional = true }
-reqwest = { version = "0.12.28", optional = true, default-features = false, features = [
+# Non-optional: used by the DeepL-compatible remote translation backend
+# (always compiled in) as well as the stt_ferrum / stt_openai backends.
+reqwest = { version = "0.12.28", default-features = false, features = [
     "blocking",
     "json",
     "multipart",
@@ -44,17 +41,18 @@ opusic-sys = { version = "0.5.8", optional = true }
 cc = "1.1.31"
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
-ffmpeg-next = { git = "https://github.com/canxin121/rust-ffmpeg", features = [
+ffmpeg-next = { path = "../../third_party/rust-ffmpeg", features = [
     "build",
     "static",
     "software-resampling",
 ] }
 
 [target.'cfg(target_os = "android")'.dependencies]
-ffmpeg-next = { git = "https://github.com/canxin121/rust-ffmpeg" }
+ffmpeg-next = { path = "../../third_party/rust-ffmpeg" }
 
 [features]
-default = ["stt_local_cpu"]
-stt_local_cpu = ["dep:whisper-rs"]
-stt_local_cuda = ["dep:whisper-rs", "whisper-rs/cuda"]
-stt_remote_http = ["dep:reqwest", "dep:hex", "dep:opusic-sys"]
+# Pure remote client: both backends are compiled in, the active one is picked
+# at runtime via `config.stt.backend`.
+default = ["stt_ferrum", "stt_openai"]
+stt_ferrum = ["dep:hex", "dep:opusic-sys"]
+stt_openai = []

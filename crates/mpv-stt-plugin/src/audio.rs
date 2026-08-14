@@ -48,6 +48,18 @@ fn output_channel_layout(channels: u8) -> ffmpeg::channel_layout::ChannelLayout 
     }
 }
 
+/// Decoded frames may carry an UNSPEC channel order (empty mask), e.g. WAV
+/// files without an explicit channel mask. FFmpeg 9's `swr_convert_frame`
+/// strict-compares the frame layout against the configured source layout and
+/// returns `AVERROR_INPUT_CHANGED` on any mismatch. Normalize the frame layout
+/// to a concrete one derived from the channel count so it matches the
+/// resampler configuration.
+fn normalize_frame_layout(frame: &mut ffmpeg::frame::Audio) {
+    if frame.channel_layout().is_empty() {
+        frame.set_channel_layout(output_channel_layout(frame.channels() as u8));
+    }
+}
+
 pub struct AudioExtractor {
     output_sample_rate: u32,
     output_channels: u8,
@@ -168,9 +180,20 @@ impl AudioExtractor {
 
         let output_layout = output_channel_layout(self.output_channels);
         let output_format = Sample::I16(SampleType::Packed);
+
+        // The decoder is not opened yet, so its `channel_layout()` may carry an
+        // empty mask (channels > 0 but layout unknown). FFmpeg 9's swr compares
+        // this against the decoded frame's layout and fails with
+        // AVERROR_INPUT_CHANGED. Derive a concrete source layout from the
+        // channel count instead, so it matches the frames once decoded.
+        let src_layout = if decoder.channel_layout().is_empty() {
+            output_channel_layout(decoder.channels() as u8)
+        } else {
+            decoder.channel_layout()
+        };
         let mut resampler = ffmpeg::software::resampling::Context::get(
             decoder.format(),
-            decoder.channel_layout(),
+            src_layout,
             decoder.rate() as u32,
             output_format,
             output_layout,
@@ -216,6 +239,8 @@ impl AudioExtractor {
             while decoder.receive_frame(&mut decoded).is_ok() {
                 check_timeout(start_time, self.ffmpeg_timeout, "ffmpeg")?;
                 self.check_cancel(run_generation)?;
+
+                normalize_frame_layout(&mut decoded);
 
                 let mut resampled = ffmpeg::frame::Audio::empty();
                 let _ = resampler
@@ -271,6 +296,9 @@ impl AudioExtractor {
             while decoder.receive_frame(&mut decoded).is_ok() {
                 check_timeout(start_time, self.ffmpeg_timeout, "ffmpeg")?;
                 self.check_cancel(run_generation)?;
+
+                normalize_frame_layout(&mut decoded);
+
                 let mut resampled = ffmpeg::frame::Audio::empty();
                 let _ = resampler
                     .run(&decoded, &mut resampled)

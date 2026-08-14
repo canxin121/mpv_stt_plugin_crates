@@ -13,10 +13,6 @@ use std::ffi::CString;
 
 use crate::audio::AudioExtractor;
 use crate::config::Config;
-#[cfg(any(feature = "stt_local_cpu", feature = "stt_local_cuda"))]
-use crate::stt::LocalModelConfig;
-#[cfg(feature = "stt_remote_http")]
-use crate::stt::RemoteSttConfig;
 use crate::stt::{SttBackend, SttRunner};
 use crate::subtitle_manager::SubtitleManager;
 use crate::translate::{AsyncTranslationQueue, TranslationTask, TranslatorConfig};
@@ -120,41 +116,11 @@ impl PluginState {
             .with_ffmpeg_timeout(config.timeout.ffmpeg_ms)
             .with_ffprobe_timeout(config.timeout.ffprobe_ms);
 
-        // Initialize speech-to-text backend (selected at compile time)
-        #[cfg(any(feature = "stt_local_cpu", feature = "stt_local_cuda"))]
-        let stt_runner = {
-            let stt_cfg = config
-                .stt
-                .local_whisper
-                .as_ref()
-                .expect("Missing [stt.local_whisper] config for local backend");
-            let stt_config = LocalModelConfig::new(stt_cfg.model_path.clone())
-                .with_threads(stt_cfg.threads)
-                .with_language(stt_cfg.language.clone())
-                .with_gpu_device(stt_cfg.gpu_device)
-                .with_flash_attn(stt_cfg.flash_attn)
-                .with_timeout_ms(stt_cfg.timeout_ms);
-            SttRunner::new(stt_config)
-        };
-
-        #[cfg(feature = "stt_remote_http")]
-        let stt_runner = {
-            let cfg = config
-                .stt
-                .remote_http
-                .as_ref()
-                .expect("Missing [stt.remote_http] config for remote backend");
-            let remote_config = RemoteSttConfig {
-                server_addr: cfg.server_addr.clone(),
-                timeout_ms: cfg.timeout_ms,
-                max_retry: cfg.max_retry,
-                use_opus: cfg.use_opus,
-                enable_encryption: cfg.enable_encryption,
-                encryption_key: cfg.encryption_key.clone(),
-                auth_secret: cfg.auth_secret.clone(),
-            };
-            SttRunner::new(remote_config).expect("Failed to create remote STT client")
-        };
+        // Initialize the STT backend chosen at runtime by [stt] backend key.
+        // Both remote backends are compiled in; `from_config` matches the
+        // `config.stt.backend` enum to the active one.
+        let stt_runner =
+            SttRunner::from_config(&config.stt).expect("Failed to init STT backend from config");
 
         // Initialize async translation queue (always enabled)
         let async_translation_queue = Some(AsyncTranslationQueue::new(
@@ -185,12 +151,22 @@ impl PluginState {
     }
 
     fn build_translator_config(config: &Config) -> TranslatorConfig {
+        let libretranslate = config
+            .translate
+            .libretranslate
+            .as_ref()
+            .expect("Missing [translate.libretranslate] config for libretranslate backend");
         TranslatorConfig::new(
             config.translate.from_lang.clone(),
             config.translate.to_lang.clone(),
         )
+        .with_backend(config.translate.backend)
         .with_timeout_ms(config.timeout.translate_ms)
         .with_concurrency(config.translate.concurrency)
+        .with_server_addr(config.translate.server_addr.clone())
+        .with_api_key(config.translate.api_key.clone())
+        .with_libretranslate_server_addr(libretranslate.server_addr.clone())
+        .with_libretranslate_api_key(libretranslate.api_key.clone())
     }
 
     fn local_chunk_size(&self) -> u64 {

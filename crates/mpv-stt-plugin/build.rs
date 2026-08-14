@@ -37,14 +37,21 @@ fn main() {
     }
 
     let target = env::var("TARGET").unwrap_or_default();
-    if !target.contains("android") {
+    if target.contains("android") {
+        // On Android we ship libmpv from the prebuilt prefix.
+        // If the prefix is missing, fail fast instead of producing a broken .so.
+        let mpv_prefix = env::var("MPV_PREFIX").unwrap_or_default();
+        let mpv_lib_dir = env::var("MPV_LIB_DIR").unwrap_or_else(|_| format!("{mpv_prefix}/lib"));
+        println!("cargo:rustc-link-search=native={mpv_lib_dir}");
+        println!("cargo:rustc-link-lib=mpv");
         return;
     }
 
-    // On Android we ship libmpv from the prebuilt prefix.
-    // If the prefix is missing, fail fast instead of producing a broken .so.
-    let mpv_prefix = env::var("MPV_PREFIX").unwrap_or_default();
-    let mpv_lib_dir = env::var("MPV_LIB_DIR").unwrap_or_else(|_| format!("{mpv_prefix}/lib"));
-    println!("cargo:rustc-link-search=native={mpv_lib_dir}");
-    println!("cargo:rustc-link-lib=mpv");
+    // Desktop mpv cplugin: the mpv C API symbols (_mpv_command, _mpv_get_property, ...)
+    // are provided by the host mpv process at load time, so the dylib must link with
+    // unresolved symbols allowed. On macOS this is `-undefined dynamic_lookup`.
+    if target.contains("apple") {
+        println!("cargo:rustc-link-arg=-undefined");
+        println!("cargo:rustc-link-arg=dynamic_lookup");
+    }
 }

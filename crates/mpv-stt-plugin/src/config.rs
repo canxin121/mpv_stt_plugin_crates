@@ -8,6 +8,58 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::PathBuf;
 
+/// Which remote STT backend to use at runtime. The plugin is a pure remote
+/// client: both backends are compiled in, and this key selects the active one
+/// (no compile-time feature exclusivity).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum BackendKind {
+    Ferrum,
+    OpenAi,
+}
+
+impl Default for BackendKind {
+    fn default() -> Self {
+        BackendKind::OpenAi
+    }
+}
+
+impl std::fmt::Display for BackendKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let label = match self {
+            BackendKind::Ferrum => "ferrum",
+            BackendKind::OpenAi => "openai",
+        };
+        write!(f, "{label}")
+    }
+}
+
+/// Which translation protocol to use at runtime. Both protocols are compiled
+/// in (no feature exclusivity); this key selects the active one. Mirrors
+/// `BackendKind` for the STT backends.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum TranslateBackendKind {
+    DeepL,
+    LibreTranslate,
+}
+
+impl Default for TranslateBackendKind {
+    fn default() -> Self {
+        TranslateBackendKind::DeepL
+    }
+}
+
+impl std::fmt::Display for TranslateBackendKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let label = match self {
+            TranslateBackendKind::DeepL => "deepl",
+            TranslateBackendKind::LibreTranslate => "libretranslate",
+        };
+        write!(f, "{label}")
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum InferenceDevice {
@@ -71,45 +123,33 @@ impl Default for Config {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SttConfig {
-    pub local_whisper: Option<SttLocalWhisperConfig>,
-    pub remote_http: Option<SttRemoteHttpConfig>,
+    /// Runtime backend selector: which of the compiled remote backends is active.
+    pub backend: BackendKind,
+    pub ferrum: Option<SttFerrumConfig>,
+    pub openai: Option<SttOpenAiConfig>,
 }
 
 impl Default for SttConfig {
     fn default() -> Self {
         Self {
-            local_whisper: Some(SttLocalWhisperConfig::default()),
-            remote_http: Some(SttRemoteHttpConfig::default()),
+            backend: BackendKind::default(),
+            ferrum: Some(SttFerrumConfig::default()),
+            openai: Some(SttOpenAiConfig::default()),
         }
     }
 }
 
+/// Custom "ferrum" protocol backend: postcard-free raw HTTP against a
+/// ferrum-capable server (e.g. subtitle-gateway's /transcribe endpoint), with
+/// optional Opus compression, AES-GCM encryption and token auth.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SttLocalWhisperConfig {
-    pub model_path: String,
-    pub threads: u8,
-    pub language: String,
-    pub gpu_device: i32,
-    pub flash_attn: bool,
-    pub timeout_ms: u64,
-}
-
-impl Default for SttLocalWhisperConfig {
-    fn default() -> Self {
-        Self {
-            model_path: "ggml-base.bin".to_string(),
-            threads: 8,
-            language: "en".to_string(),
-            gpu_device: 0,
-            flash_attn: false,
-            timeout_ms: 120_000,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SttRemoteHttpConfig {
+pub struct SttFerrumConfig {
     pub server_addr: String,
+    /// Model id sent via the `x-model` header, e.g. "sensevoice" or "fun-asr-mlt-nano".
+    pub model: String,
+    /// Optional language hint sent via the `x-language` header (e.g. "ja",
+    /// "zh", "en"); `None` = server auto-detects.
+    pub language: Option<String>,
     pub timeout_ms: u64,
     pub max_retry: usize,
     /// Enable Opus compression to reduce network payload size.
@@ -119,10 +159,12 @@ pub struct SttRemoteHttpConfig {
     pub auth_secret: String,
 }
 
-impl Default for SttRemoteHttpConfig {
+impl Default for SttFerrumConfig {
     fn default() -> Self {
         Self {
             server_addr: "http://127.0.0.1:9000".to_string(),
+            model: "sensevoice".to_string(),
+            language: None,
             timeout_ms: 120_000,
             max_retry: 3,
             use_opus: true,
@@ -134,10 +176,49 @@ impl Default for SttRemoteHttpConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SttOpenAiConfig {
+    /// Base URL of an OpenAI-compatible transcription server, e.g. http://127.0.0.1:8000.
+    pub server_addr: String,
+    /// Model id sent in the multipart form, e.g. "sensevoice" or "fun-asr-mlt-nano".
+    pub model: String,
+    /// Optional language hint (e.g. "ja", "zh", "en").
+    pub language: Option<String>,
+    /// Optional API key sent as `Authorization: Bearer {key}` for servers that
+    /// require auth (e.g. OpenAI-hosted or any key-gated compatible service).
+    /// `None` omits the header (local subtitle-gateway needs no key).
+    pub api_key: Option<String>,
+    pub timeout_ms: u64,
+    pub max_retry: usize,
+}
+
+impl Default for SttOpenAiConfig {
+    fn default() -> Self {
+        Self {
+            server_addr: "http://127.0.0.1:8000".to_string(),
+            model: "sensevoice".to_string(),
+            language: None,
+            api_key: None,
+            timeout_ms: 120_000,
+            max_retry: 3,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranslateConfig {
     pub from_lang: String,
     pub to_lang: String,
     pub concurrency: usize,
+    /// Runtime protocol selector: which of the compiled translation protocols
+    /// is active (`deepl` | `libretranslate`).
+    pub backend: TranslateBackendKind,
+    /// DeepL-compatible translation service base URL (e.g. the subtitle-gateway
+    /// gateway at its default port 8000, or an upstream DeepL-compatible API).
+    pub server_addr: String,
+    /// Optional API key, sent as `Authorization: DeepL-Auth-Key {key}`.
+    pub api_key: String,
+    /// LibreTranslate backend (only read when `backend = "libretranslate"`).
+    pub libretranslate: Option<TranslateLibreTranslateConfig>,
 }
 
 impl Default for TranslateConfig {
@@ -146,6 +227,27 @@ impl Default for TranslateConfig {
             from_lang: "en".to_string(),
             to_lang: "zh".to_string(),
             concurrency: 4,
+            backend: TranslateBackendKind::default(),
+            server_addr: "http://127.0.0.1:8000".to_string(),
+            api_key: String::new(),
+            libretranslate: Some(TranslateLibreTranslateConfig::default()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TranslateLibreTranslateConfig {
+    /// LibreTranslate-compatible service base URL.
+    pub server_addr: String,
+    /// Optional API key, sent in the request body as `api_key`.
+    pub api_key: String,
+}
+
+impl Default for TranslateLibreTranslateConfig {
+    fn default() -> Self {
+        Self {
+            server_addr: "http://127.0.0.1:8000".to_string(),
+            api_key: String::new(),
         }
     }
 }
