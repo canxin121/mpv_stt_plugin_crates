@@ -266,7 +266,11 @@ target_for_platform() {
 
 # Android ABI configurations (details resolved via android_abi_spec in setup-deps)
 SUPPORTED_ANDROID_ABIS=("arm64-v8a" "armeabi-v7a" "x86" "x86_64")
-DEFAULT_ANDROID_ABIS=("arm64-v8a" "armeabi-v7a")
+# Default is 64-bit only: the 32-bit ABIs (armeabi-v7a, x86) are currently
+# blocked by an upstream ffmpeg-sys-next bug — its Vulkan stub header hardcodes
+# `sizeof(VkPhysicalDeviceFeatures2) == 240`, which only holds for 64-bit
+# pointers, so bindgen fails on 32-bit targets.
+DEFAULT_ANDROID_ABIS=("arm64-v8a")
 
 # Feature configurations. The plugin is a pure remote client; both backends are
 # compiled in by default (single .so, runtime switch). `-f` selects a
@@ -314,8 +318,10 @@ Examples:
   # Single-backend build (OpenAI only)
   ./scripts/build-all.sh -p darwin-arm64 -f stt_openai
 
-  # Android arm64 & armv7 (needs NDK; ferrum pulls opusic-sys cross-compile)
-  ./scripts/build-all.sh -p android -a arm64-v8a,armeabi-v7a
+  # Android arm64 (needs NDK; ferrum pulls opusic-sys cross-compile).
+  # 32-bit ABIs (armeabi-v7a, x86) are currently blocked by an upstream
+  # ffmpeg-sys-next Vulkan-stub assert; see DEFAULT_ANDROID_ABIS.
+  ./scripts/build-all.sh -p android -a arm64-v8a
 EOUSAGE
 }
 

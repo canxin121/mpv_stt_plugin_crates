@@ -78,7 +78,7 @@ jobs:
             dist/build.log
 
   android:
-    name: android (arm64-v8a, armeabi-v7a)
+    name: android (arm64-v8a)
     runs-on: ubuntu-latest
     env:
       ANDROID_NDK_HOME: ${{ github.workspace }}/target/android-ndk-r29
@@ -96,7 +96,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-linux-android,armv7-linux-androideabi
+          targets: aarch64-linux-android
 
       - name: Download Android NDK r29
         run: |
@@ -122,7 +122,7 @@ jobs:
             CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" \
             RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" \
             ANDROID_NDK_HOME="$ANDROID_NDK_HOME" NDK="$NDK" TERM=xterm \
-            ./scripts/build-all.sh -p android -a arm64-v8a,armeabi-v7a || {
+            ./scripts/build-all.sh -p android -a arm64-v8a || {
             echo "=== dist/build.log (tail 400) ===";
             tail -n 400 dist/build.log || true;
             echo "=== error-ish lines in dist/build.log ===";

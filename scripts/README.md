@@ -17,12 +17,12 @@
 | `darwin-arm64` | `aarch64-apple-darwin` | `libmpv_stt_plugin.dylib` |
 | `darwin-x86_64` | `x86_64-apple-darwin` | `libmpv_stt_plugin.dylib` |
 | `windows-x86_64` | `x86_64-pc-windows-msvc` | `mpv_stt_plugin.dll` |
-| `android` (4 ABI) | `aarch64-linux-android` / `armv7-linux-androideabi` / `i686-linux-android` / `x86_64-linux-android` | `libmpv_stt_plugin.so` |
+| `android` (默认 arm64-v8a) | `aarch64-linux-android`(默认;32 位 ABI 受上游阻塞,见下) | `libmpv_stt_plugin.so` |
 
 **使用方法**:
 
 ```bash
-# 1. 全平台矩阵(默认): 桌面 4 平台 + Android 默认 2 ABI
+# 1. 全平台矩阵(默认): 桌面 4 平台 + Android 默认 arm64-v8a
 ./scripts/build-all.sh
 
 # 2. 指定平台(如当前 macOS 宿主)
@@ -31,9 +31,11 @@
 # 3. 单后端专用构建(默认双后端)
 ./scripts/build-all.sh -p darwin-arm64 -f stt_openai
 
-# 4. Android(需 NDK;默认 arm64-v8a + armeabi-v7a)
+# 4. Android(需 NDK;默认 arm64-v8a。32 位 ABI 受上游 ffmpeg-sys-next 的
+#    Vulkan 假头 assert 阻塞:`sizeof(VkPhysicalDeviceFeatures2) == 240` 仅对
+#    64 位指针成立,见 build-all.sh 内 DEFAULT_ANDROID_ABIS 注释)
 export ANDROID_NDK_HOME=~/Library/Android/sdk/ndk/26.1.10909125
-./scripts/build-all.sh -p android -a arm64-v8a,armeabi-v7a
+./scripts/build-all.sh -p android -a arm64-v8a
 
 # 5. 仅检查不产物 / 清理 dist
 ./scripts/build-all.sh --check
@@ -59,9 +61,7 @@ dist/
 ├── darwin-x86_64/plugin/libmpv_stt_plugin.dylib
 ├── windows-x86_64/plugin/mpv_stt_plugin.dll
 ├── android/
-│   ├── arm64-v8a/plugin/libmpv_stt_plugin.so
-│   ├── armeabi-v7a/plugin/libmpv_stt_plugin.so
-│   └── ...
+│   └── arm64-v8a/plugin/libmpv_stt_plugin.so   # 默认 ABI
 ├── MANIFEST.txt          # 产物清单
 └── build.log             # 构建日志
 ```
@@ -90,5 +90,6 @@ dist/
 `.github/workflows/build.yml`:
 - **desktop 矩阵**: `ubuntu-latest` → linux-x86_64、`macos-latest` → darwin-arm64、
   `windows-latest` → windows-x86_64(best-effort,失败不阻塞)。
-- **android job**: `ubuntu-latest` 下载 NDK r29,构建 arm64-v8a + armeabi-v7a。
+- **android job**: `ubuntu-latest` 下载 NDK r29,构建 arm64-v8a(默认 ABI;
+  32 位 ABI 暂受上游 ffmpeg-sys-next Vulkan-stub assert 阻塞)。
 - 产物以 `dist-<platform>` / `dist-android` 上传为 GitHub Actions artifacts。

@@ -80,15 +80,15 @@ ls target/release/libmpv_stt_plugin.dylib
 ### 全平台构建
 
 ```bash
-# 全平台矩阵(桌面 4 平台 + Android 默认 2 ABI),每个平台/ABI 一个动态库(双后端编入)
+# 全平台矩阵(桌面 4 平台 + Android 默认 arm64-v8a),每个平台/ABI 一个动态库(双后端编入)
 ./scripts/build-all.sh
 
 # 指定平台
 ./scripts/build-all.sh -p darwin-arm64
 
-# Android(需 NDK)
+# Android(需 NDK;32 位 ABI 受上游 ffmpeg-sys-next 的 vulkan 假头 assert 阻塞,见下)
 export ANDROID_NDK_HOME=~/Android/Sdk/ndk/26.1.10909125
-./scripts/build-all.sh -p android -a arm64-v8a,armeabi-v7a
+./scripts/build-all.sh -p android -a arm64-v8a
 
 ./scripts/build-all.sh -l   # 列出支持的平台/feature/ABI
 ```
@@ -101,7 +101,11 @@ export ANDROID_NDK_HOME=~/Android/Sdk/ndk/26.1.10909125
 | macOS arm64 | `dist/darwin-arm64/plugin/libmpv_stt_plugin.dylib` |
 | macOS x86_64 | `dist/darwin-x86_64/plugin/libmpv_stt_plugin.dylib` |
 | Windows x86_64 | `dist/windows-x86_64/plugin/mpv_stt_plugin.dll`(best-effort) |
-| Android(4 ABI) | `dist/android/<abi>/plugin/libmpv_stt_plugin.so` |
+| Android(arm64-v8a,默认) | `dist/android/<abi>/plugin/libmpv_stt_plugin.so` |
+
+> **注**: `armeabi-v7a` / `x86`(32 位 ABI)暂未纳入默认构建——上游
+> `ffmpeg-sys-next` 的 Vulkan stub 头硬编码 `sizeof(VkPhysicalDeviceFeatures2) == 240`
+> (仅 64 位指针成立),bindgen 在 32 位目标上会失败。等上游修复后再放开。
 
 产物默认**双后端编入**(单个动态库),运行时 `config.stt.backend` 切换;需要单后端
 专用构建时加 `-f stt_ferrum` / `-f stt_openai`。
