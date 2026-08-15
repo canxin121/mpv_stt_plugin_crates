@@ -1,10 +1,10 @@
+use crate::common::{MpvSttError, Result};
 use ffmpeg::format::Sample;
 use ffmpeg::format::sample::Type as SampleType;
 use ffmpeg::util::mathematics::rescale;
 use ffmpeg::util::mathematics::rescale::Rescale;
 use ffmpeg_next as ffmpeg;
 use log::{debug, trace};
-use crate::common::{MpvSttError, Result};
 use std::path::Path;
 use std::sync::{
     Arc, OnceLock,
@@ -60,6 +60,7 @@ fn normalize_frame_layout(frame: &mut ffmpeg::frame::Audio) {
     }
 }
 
+#[derive(Clone)]
 pub struct AudioExtractor {
     output_sample_rate: u32,
     output_channels: u8,

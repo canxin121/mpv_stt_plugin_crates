@@ -556,12 +556,23 @@ check_env() {
     fi
 }
 
-# Artifact filename for the single crate on a given rust target triple.
-artifact_name() {
+# Cargo's native cdylib filename for a target triple.
+cargo_artifact_name() {
     local target="$1"
     case "$target" in
         *windows*)   echo "mpv_stt_plugin.dll" ;;
         *apple*)     echo "libmpv_stt_plugin.dylib" ;;
+        *)           echo "libmpv_stt_plugin.so" ;;
+    esac
+}
+
+# Installable mpv C-plugin filename. mpv selects its script backend by the
+# filename extension and accepts only .so on every non-Windows platform,
+# including macOS (even though Cargo emits a Mach-O file named .dylib).
+artifact_name() {
+    local target="$1"
+    case "$target" in
+        *windows*)   echo "mpv_stt_plugin.dll" ;;
         *)           echo "libmpv_stt_plugin.so" ;;
     esac
 }
@@ -804,9 +815,16 @@ build_desktop() {
         if [[ "${BUILD_MODE}" == "build" ]]; then
             local out_dir="${DIST_DIR}/${platform}/plugin"
             mkdir -p "${out_dir}"
-            local art
-            art="$(artifact_name "${target}")"
-            cp "${WORKSPACE_ROOT}/target/${target}/release/${art}" "${out_dir}/${art}"
+            local cargo_art dist_art
+            cargo_art="$(cargo_artifact_name "${target}")"
+            dist_art="$(artifact_name "${target}")"
+            # Remove the pre-fix macOS filename so an incremental dist does not
+            # keep advertising an unloadable .dylib beside the valid .so.
+            if [[ "${target}" == *apple* ]]; then
+                rm -f "${out_dir}/libmpv_stt_plugin.dylib"
+            fi
+            cp "${WORKSPACE_ROOT}/target/${target}/release/${cargo_art}" \
+               "${out_dir}/${dist_art}"
             # Ship the dynamic FFmpeg libraries alongside the plugin (Windows
             # .dll, Linux .so); macOS keeps the brew dylibs in place.
             collect_ffmpeg_runtime "${platform}"

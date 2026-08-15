@@ -1,9 +1,9 @@
 use super::{BackendKind, SttBackend, SttDeviceNotice};
-use log::{debug, trace};
 use crate::common::{MpvSttError, Result};
 use crate::srt::{SrtFile, SubtitleEntry, Timestamp};
-use reqwest::blocking::multipart::{Form, Part};
-use reqwest::blocking::Client;
+use log::{debug, trace};
+use reqwest::Client;
+use reqwest::multipart::{Form, Part};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -63,9 +63,7 @@ impl OpenAiBackend {
 
         trace!(
             "Remote OpenAI STT: {} (duration: {}ms, model: {})",
-            audio_str,
-            duration_ms,
-            self.model
+            audio_str, duration_ms, self.model
         );
 
         let run_generation = self.cancel_generation.load(Ordering::Relaxed);
@@ -79,12 +77,16 @@ impl OpenAiBackend {
         }
 
         let request_id = self.generate_request_id();
-        let json = self.send_with_retry(
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| MpvSttError::SttFailed(format!("Async runtime build failed: {e}")))?;
+        let json = runtime.block_on(self.send_with_retry(
             request_id,
             &audio_data,
             duration_ms,
             run_generation,
-        )?;
+        ))?;
 
         if self.cancel_generation.load(Ordering::Relaxed) != run_generation {
             return Err(MpvSttError::SttCancelled);
@@ -125,7 +127,7 @@ impl OpenAiBackend {
             .as_nanos() as u64
     }
 
-    fn send_with_retry(
+    async fn send_with_retry(
         &self,
         request_id: u64,
         audio: &[u8],
@@ -133,19 +135,29 @@ impl OpenAiBackend {
         run_generation: u64,
     ) -> Result<Vec<u8>> {
         let mut last_error = None;
+        let max_attempts = self.max_retry.max(1);
 
-        for attempt in 0..self.max_retry {
+        for attempt in 0..max_attempts {
             if self.cancel_generation.load(Ordering::Relaxed) != run_generation {
                 return Err(MpvSttError::SttCancelled);
             }
 
-            match self.send_request(request_id, audio, duration_ms, run_generation) {
+            match self
+                .send_request(request_id, audio, duration_ms, run_generation)
+                .await
+            {
                 Ok(result) => return Ok(result),
                 Err(e) => {
                     last_error = Some(e);
-                    if attempt + 1 < self.max_retry {
+                    if attempt + 1 < max_attempts {
                         debug!("OpenAI request attempt {} failed, retrying...", attempt + 1);
-                        std::thread::sleep(Duration::from_millis(500));
+                        tokio::select! {
+                            () = tokio::time::sleep(Duration::from_millis(500)) => {}
+                            () = Self::wait_for_cancellation(
+                                &self.cancel_generation,
+                                run_generation,
+                            ) => return Err(MpvSttError::SttCancelled),
+                        }
                     }
                 }
             }
@@ -154,7 +166,7 @@ impl OpenAiBackend {
         Err(last_error.unwrap())
     }
 
-    fn send_request(
+    async fn send_request(
         &self,
         request_id: u64,
         audio: &[u8],
@@ -186,29 +198,36 @@ impl OpenAiBackend {
         if let Some(key) = self.api_key.as_ref() {
             request = request.bearer_auth(key);
         }
-        let response = request
-            .send()
-            .map_err(|e| MpvSttError::SttFailed(format!("HTTP send failed: {}", e)))?;
+        let request_future = async {
+            let response = request
+                .send()
+                .await
+                .map_err(|e| MpvSttError::SttFailed(format!("HTTP send failed: {}", e)))?;
+            let status = response.status();
+            if !status.is_success() {
+                let text = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| "unknown error".to_string());
+                return Err(MpvSttError::SttFailed(format!(
+                    "Server error ({}): {}",
+                    status, text
+                )));
+            }
 
-        if self.cancel_generation.load(Ordering::Relaxed) != run_generation {
-            return Err(MpvSttError::SttCancelled);
-        }
-
-        let status = response.status();
-        if !status.is_success() {
-            let text = response
-                .text()
-                .unwrap_or_else(|_| "unknown error".to_string());
-            return Err(MpvSttError::SttFailed(format!(
-                "Server error ({}): {}",
-                status, text
-            )));
-        }
-
-        let data = response
-            .bytes()
-            .map_err(|e| MpvSttError::SttFailed(format!("HTTP body read failed: {}", e)))?
-            .to_vec();
+            response
+                .bytes()
+                .await
+                .map(|bytes| bytes.to_vec())
+                .map_err(|e| MpvSttError::SttFailed(format!("HTTP body read failed: {}", e)))
+        };
+        let data = tokio::select! {
+            result = request_future => result?,
+            () = Self::wait_for_cancellation(
+                &self.cancel_generation,
+                run_generation,
+            ) => return Err(MpvSttError::SttCancelled),
+        };
 
         debug!(
             "OpenAI req {} duration_ms={} wall={}ms model={} resp_bytes={}",
@@ -220,6 +239,15 @@ impl OpenAiBackend {
         );
 
         Ok(data)
+    }
+
+    async fn wait_for_cancellation(cancel_generation: &AtomicU64, run_generation: u64) {
+        loop {
+            if cancel_generation.load(Ordering::Acquire) != run_generation {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
     }
 }
 
@@ -244,7 +272,10 @@ fn parse_segments(json: &[u8]) -> Result<Vec<Segment>> {
         MpvSttError::SttFailed(format!(
             "Failed to parse OpenAI response: {} (body: {})",
             e,
-            String::from_utf8_lossy(json).chars().take(200).collect::<String>()
+            String::from_utf8_lossy(json)
+                .chars()
+                .take(200)
+                .collect::<String>()
         ))
     })?;
     Ok(resp.segments)
@@ -274,6 +305,10 @@ impl SttBackend for OpenAiBackend {
 
     fn cancel_inflight(&self) {
         self.cancel_generation.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn cancellation_generation(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.cancel_generation)
     }
 
     fn take_device_notice(&mut self) -> Option<SttDeviceNotice> {

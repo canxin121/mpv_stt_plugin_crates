@@ -14,8 +14,8 @@
 | 平台 | FFmpeg 来源 | Rust target | 产物 |
 |---|---|---|---|
 | `linux-x86_64` | BtbN 共享包(自动下载) | `x86_64-unknown-linux-gnu` | `libmpv_stt_plugin.so` |
-| `darwin-arm64` | brew ffmpeg | `aarch64-apple-darwin` | `libmpv_stt_plugin.dylib` |
-| `darwin-x86_64` | brew ffmpeg | `x86_64-apple-darwin` | `libmpv_stt_plugin.dylib` |
+| `darwin-arm64` | brew ffmpeg | `aarch64-apple-darwin` | `libmpv_stt_plugin.so` |
+| `darwin-x86_64` | brew ffmpeg | `x86_64-apple-darwin` | `libmpv_stt_plugin.so` |
 | `windows-x86_64` | BtbN 共享包(自动下载) | `x86_64-pc-windows-msvc` | `mpv_stt_plugin.dll` |
 | `android` (默认 arm64-v8a) | Android 侧动态 libffmpeg(随 APK) | `aarch64-linux-android`(默认;32 位 ABI 受上游阻塞,见下) | `libmpv_stt_plugin.so` |
 
@@ -71,8 +71,8 @@ export ANDROID_NDK_HOME=~/Library/Android/sdk/ndk/26.1.10909125
 dist/
 ├── linux-x86_64/plugin/libmpv_stt_plugin.so
 │   └── runtime/lib*.so*                 # FFmpeg 运行时库
-├── darwin-arm64/plugin/libmpv_stt_plugin.dylib
-├── darwin-x86_64/plugin/libmpv_stt_plugin.dylib
+├── darwin-arm64/plugin/libmpv_stt_plugin.so
+├── darwin-x86_64/plugin/libmpv_stt_plugin.so
 ├── windows-x86_64/plugin/mpv_stt_plugin.dll
 │   └── runtime/*.dll                    # FFmpeg 运行时库
 ├── android/
@@ -96,6 +96,8 @@ dist/
 - 首次构建会自动 `rustup target add ...`。
 - 失败的构建记录在 `dist/build.log`。
 - BtbN 共享包缓存于 `target/ffmpeg-btbn`,重复构建不重复下载。
+- macOS 的 Cargo 原生产物扩展名是 `.dylib`,但 mpv C 插件加载器在非 Windows
+  平台只识别 `.so`;构建脚本会在复制到 `dist/` 时正确改名为 `.so`。
 
 ## `android-mpv/` — Android 交叉编译辅助
 

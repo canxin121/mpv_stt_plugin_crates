@@ -2,9 +2,14 @@ use log::{debug, error, info, trace, warn};
 use mpv_client::{Event, Handle, mpv_handle};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
+use std::thread;
 use std::time::Instant;
 use tempfile::TempDir;
 
@@ -12,12 +17,12 @@ use tempfile::TempDir;
 use std::ffi::CString;
 
 use crate::audio::AudioExtractor;
+use crate::common::MpvSttError;
 use crate::config::Config;
-use crate::stt::{SttBackend, SttRunner};
+use crate::srt::SrtFile;
+use crate::stt::{SttBackend, SttDeviceNotice, SttRunner};
 use crate::subtitle_manager::SubtitleManager;
 use crate::translate::{AsyncTranslationQueue, TranslationTask, TranslatorConfig};
-use crate::common::MpvSttError;
-use crate::srt::SrtFile;
 
 struct TempPaths {
     _dir: TempDir,
@@ -27,20 +32,19 @@ struct TempPaths {
 }
 
 impl TempPaths {
-    fn new() -> Self {
+    fn new() -> crate::common::Result<Self> {
         let dir = tempfile::Builder::new()
             .prefix("mpv_stt_plugin_rs_")
-            .tempdir()
-            .expect("failed to create temp dir");
+            .tempdir()?;
 
-        Self {
+        Ok(Self {
             tmp_wav: dir.path().join("audio.wav"),
             // `tmp_sub` is a prefix; intermediate files are derived via `format!("{}_append...", tmp_sub.display())`
             // and the main subtitle file is `tmp_sub.with_extension("srt")`.
             tmp_sub: dir.path().join("subs"),
             tmp_cache: dir.path().join("cache.mkv"),
             _dir: dir,
-        }
+        })
     }
 
     fn cleanup_intermediate_subs(&self) {
@@ -86,11 +90,192 @@ enum ProcessingMode {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlCommand {
+    ToggleStt,
+    ToggleTranslate,
+    ClearCache,
+}
+
+impl ControlCommand {
+    fn from_client_message(args: &[&str]) -> Option<Self> {
+        // `script-message-to` normally puts the payload command in args[0].
+        // Accept args[1] as well for compatibility with older mpv/IINA builds
+        // and user input.conf entries that included an extra routing token.
+        args.iter().take(2).find_map(|arg| match *arg {
+            "toggle-stt" => Some(Self::ToggleStt),
+            "toggle-translate" => Some(Self::ToggleTranslate),
+            "clear-cache" => Some(Self::ClearCache),
+            _ => None,
+        })
+    }
+}
+
+const KEY_BINDINGS: [(&str, &str); 3] = [
+    ("Ctrl+Shift+S", "toggle-stt"),
+    ("Ctrl+Shift+T", "toggle-translate"),
+    ("Ctrl+Shift+C", "clear-cache"),
+];
+
+fn key_binding_section(target: &str) -> String {
+    KEY_BINDINGS
+        .iter()
+        .map(|(key, command)| format!("{key} script-message-to {target} {command}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+struct TranscriptionJob {
+    generation: u64,
+    media_path: String,
+    audio_start_ms: u64,
+    duration_ms: u64,
+    wav_path: PathBuf,
+    output_prefix: PathBuf,
+}
+
+struct TranscriptionWorkerResult {
+    generation: u64,
+    result: crate::common::Result<()>,
+    device_notice: Option<SttDeviceNotice>,
+}
+
+struct TranscriptionWorker {
+    job_sender: Sender<Option<TranscriptionJob>>,
+    result_receiver: Receiver<TranscriptionWorkerResult>,
+    worker_handle: Option<thread::JoinHandle<()>>,
+    generation: Arc<AtomicU64>,
+    audio_canceller: AudioExtractor,
+    stt_cancel_generation: Arc<AtomicU64>,
+}
+
+impl TranscriptionWorker {
+    fn new(audio_extractor: AudioExtractor, mut stt_runner: SttRunner) -> Self {
+        let (job_sender, job_receiver) = channel::<Option<TranscriptionJob>>();
+        let (result_sender, result_receiver) = channel::<TranscriptionWorkerResult>();
+        let generation = Arc::new(AtomicU64::new(0));
+        let worker_generation = Arc::clone(&generation);
+        let worker_audio = audio_extractor.clone();
+        let stt_cancel_generation = stt_runner.cancellation_generation();
+
+        let worker_handle = thread::Builder::new()
+            .name("mpv-stt-transcription".to_string())
+            .spawn(move || {
+                while let Ok(Some(job)) = job_receiver.recv() {
+                    if worker_generation.load(Ordering::Acquire) != job.generation {
+                        continue;
+                    }
+
+                    let result = worker_audio
+                        .extract_audio_segment(
+                            job.media_path.as_str(),
+                            job.wav_path.to_str().unwrap_or_default(),
+                            job.audio_start_ms,
+                            job.duration_ms,
+                        )
+                        .and_then(|()| {
+                            if worker_generation.load(Ordering::Acquire) != job.generation {
+                                return Err(MpvSttError::SttCancelled);
+                            }
+                            stt_runner.transcribe(
+                                job.wav_path.to_str().unwrap_or_default(),
+                                job.output_prefix.to_str().unwrap_or_default(),
+                                job.duration_ms,
+                            )
+                        });
+                    let device_notice = stt_runner.take_device_notice();
+
+                    let _ = result_sender.send(TranscriptionWorkerResult {
+                        generation: job.generation,
+                        result,
+                        device_notice,
+                    });
+                }
+            })
+            .expect("failed to spawn transcription worker");
+
+        Self {
+            job_sender,
+            result_receiver,
+            worker_handle: Some(worker_handle),
+            generation,
+            audio_canceller: audio_extractor,
+            stt_cancel_generation,
+        }
+    }
+
+    fn submit(
+        &self,
+        media_path: String,
+        audio_start_ms: u64,
+        duration_ms: u64,
+        wav_path: PathBuf,
+        output_prefix: PathBuf,
+    ) -> Option<u64> {
+        let generation = self.generation.load(Ordering::Acquire);
+        let job = TranscriptionJob {
+            generation,
+            media_path,
+            audio_start_ms,
+            duration_ms,
+            wav_path,
+            output_prefix,
+        };
+        self.job_sender.send(Some(job)).ok().map(|()| generation)
+    }
+
+    fn try_recv(&self) -> Option<TranscriptionWorkerResult> {
+        let current = self.generation.load(Ordering::Acquire);
+        while let Ok(result) = self.result_receiver.try_recv() {
+            if result.generation == current {
+                return Some(result);
+            }
+            trace!(
+                "Dropping stale transcription result from generation {} (current {})",
+                result.generation, current
+            );
+        }
+        None
+    }
+
+    fn cancel_inflight(&self) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        self.audio_canceller.cancel_inflight();
+        self.stt_cancel_generation.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn shutdown(&mut self) {
+        if self.worker_handle.is_none() {
+            return;
+        }
+        self.cancel_inflight();
+        let _ = self.job_sender.send(None);
+        if let Some(handle) = self.worker_handle.take() {
+            if handle.join().is_err() {
+                warn!("Transcription worker panicked during shutdown");
+            }
+        }
+    }
+}
+
+impl Drop for TranscriptionWorker {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+struct PendingTranscription {
+    generation: u64,
+    start_ms: u64,
+    duration_ms: u64,
+    subtitle_path: Option<PathBuf>,
+}
+
 struct PluginState {
     config: Config,
     paths: TempPaths,
-    audio_extractor: AudioExtractor,
-    stt_runner: SttRunner,
+    transcription_worker: TranscriptionWorker,
+    pending_transcription: Option<PendingTranscription>,
     async_translation_queue: Option<AsyncTranslationQueue>,
     subtitle_manager: SubtitleManager,
     translation_cache: HashMap<u32, (String, String)>,
@@ -108,10 +293,11 @@ struct PluginState {
     mode: Option<ProcessingMode>,
     pending_auto_start: bool, // Delayed auto-start after file loads
     file_loaded: bool,        // Track if file is ready
+    transcription_complete: bool,
 }
 
 impl PluginState {
-    fn new(config: Config) -> Self {
+    fn new(config: Config) -> crate::common::Result<Self> {
         let chunk_dur = config.chunk.local_ms;
         let audio_extractor = AudioExtractor::default()
             .with_ffmpeg_timeout(config.timeout.ffmpeg_ms)
@@ -120,20 +306,21 @@ impl PluginState {
         // Initialize the STT backend chosen at runtime by [stt] backend key.
         // Both remote backends are compiled in; `from_config` matches the
         // `config.stt.backend` enum to the active one.
-        let stt_runner =
-            SttRunner::from_config(&config.stt).expect("Failed to init STT backend from config");
+        let stt_runner = SttRunner::from_config(&config.stt)?;
+        let transcription_worker = TranscriptionWorker::new(audio_extractor, stt_runner);
+        let paths = TempPaths::new()?;
 
         // Initialize async translation queue (always enabled)
         let async_translation_queue = Some(AsyncTranslationQueue::new(
             Self::build_translator_config(&config),
         ));
 
-        Self {
+        Ok(Self {
             chunk_dur,
             config,
-            paths: TempPaths::new(),
-            audio_extractor,
-            stt_runner,
+            paths,
+            transcription_worker,
+            pending_transcription: None,
             async_translation_queue,
             subtitle_manager: SubtitleManager::new(),
             translation_cache: HashMap::new(),
@@ -149,15 +336,17 @@ impl PluginState {
             mode: None,
             pending_auto_start: false,
             file_loaded: false,
-        }
+            transcription_complete: false,
+        })
     }
 
     fn build_translator_config(config: &Config) -> TranslatorConfig {
+        let default_libretranslate = crate::config::TranslateLibreTranslateConfig::default();
         let libretranslate = config
             .translate
             .libretranslate
             .as_ref()
-            .expect("Missing [translate.libretranslate] config for libretranslate backend");
+            .unwrap_or(&default_libretranslate);
         TranslatorConfig::new(
             config.translate.from_lang.clone(),
             config.translate.to_lang.clone(),
@@ -252,11 +441,13 @@ impl PluginState {
     fn toggle_stt(&mut self, client: &mut Handle) {
         if self.running {
             info!("Disabling STT");
-            self.running = false;
             let _ = client.command(&["show-text", "STT: Off"]);
-            self.cleanup(client);
+            self.stop_transcription();
         } else {
             info!("Enabling STT");
+            if self.mode.is_some() {
+                self.stop_transcription();
+            }
             self.running = true;
             let _ = client.command(&["show-text", "STT: On"]);
             self.start_transcription(client);
@@ -265,7 +456,14 @@ impl PluginState {
 
     fn toggle_translate(&mut self, client: &mut Handle) {
         self.translate_enabled = !self.translate_enabled;
-        info!("Translation {}", if self.translate_enabled { "enabled" } else { "disabled" });
+        info!(
+            "Translation {}",
+            if self.translate_enabled {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        );
         let msg = if self.translate_enabled {
             "Translate: On"
         } else {
@@ -300,12 +498,102 @@ impl PluginState {
             "Subtitle cache cleared (removed {} files, dropped {} cached translations)",
             removed, chunk_entries
         );
-        let msg = format!("字幕缓存已清除: 删除 {} 个文件, 内存缓存 {} 条", removed, chunk_entries);
+        let msg = format!(
+            "字幕缓存已清除: 删除 {} 个文件, 内存缓存 {} 条",
+            removed, chunk_entries
+        );
         let _ = client.command(&["show-text", &msg, "3000"]);
+    }
+
+    fn schedule_transcription(
+        &mut self,
+        media_path: String,
+        audio_start_ms: u64,
+        duration_ms: u64,
+        subtitle_path: Option<PathBuf>,
+    ) -> bool {
+        if self.pending_transcription.is_some() {
+            return false;
+        }
+
+        let output_prefix = PathBuf::from(format!("{}_append", self.paths.tmp_sub.display()));
+        let Some(generation) = self.transcription_worker.submit(
+            media_path,
+            audio_start_ms,
+            duration_ms,
+            self.paths.tmp_wav.clone(),
+            output_prefix,
+        ) else {
+            error!("Transcription worker is unavailable");
+            return false;
+        };
+
+        self.pending_transcription = Some(PendingTranscription {
+            generation,
+            start_ms: self.current_pos_ms,
+            duration_ms,
+            subtitle_path,
+        });
+        true
+    }
+
+    fn poll_transcription(&mut self, client: &mut Handle) {
+        let Some(worker_result) = self.transcription_worker.try_recv() else {
+            return;
+        };
+        let Some(pending) = self.pending_transcription.take() else {
+            return;
+        };
+        if worker_result.generation != pending.generation {
+            return;
+        }
+
+        match worker_result.result {
+            Ok(()) => {
+                if self.check_seek(client) {
+                    debug!("Seek detected after transcription; dropping stale result");
+                    self.paths.cleanup_intermediate_subs();
+                    return;
+                }
+                self.current_pos_ms = pending.start_ms;
+                if self.apply_transcription_result(
+                    client,
+                    pending.subtitle_path.as_deref(),
+                    pending.start_ms,
+                    worker_result.device_notice,
+                ) {
+                    self.current_pos_ms = pending.start_ms.saturating_add(pending.duration_ms);
+                    if !self.subs_loaded {
+                        let main_srt = pending
+                            .subtitle_path
+                            .unwrap_or_else(|| self.paths.tmp_sub.with_extension("srt"));
+                        let _ = client.command(&["sub-add", main_srt.to_str().unwrap_or_default()]);
+                        self.subs_loaded = true;
+                    }
+                    if self.config.playback.show_progress {
+                        let _ = client.command(&[
+                            "show-text",
+                            &format!("STT: {}", Self::format_progress(self.current_pos_ms)),
+                        ]);
+                    }
+                }
+            }
+            Err(MpvSttError::SttCancelled | MpvSttError::AudioExtractionCancelled) => {
+                debug!("Transcription job cancelled");
+                self.paths.cleanup_intermediate_subs();
+            }
+            Err(err) => {
+                error!("Transcription job failed: {err}");
+                let msg = format!("STT failed: {err}");
+                let _ = client.command(&["show-text", &msg, "4000"]);
+                self.stop_transcription();
+            }
+        }
     }
 
     fn start_transcription(&mut self, client: &mut Handle) {
         debug!("Starting transcription");
+        self.transcription_complete = false;
         // Get current position
         let time_pos: f64 = client.get_property("time-pos").unwrap_or(0.0);
         self.current_pos_ms = (time_pos * 1000.0) as u64;
@@ -384,8 +672,12 @@ impl PluginState {
 
                 // Calculate subtitle path next to the video file when possible.
                 // SAF content:// URIs are not writable as filesystem paths.
-                let subtitle_path = Self::get_subtitle_path_for_media_uri(&path)
-                    .unwrap_or_else(|| self.paths.tmp_sub.with_extension("srt"));
+                let subtitle_path = if self.config.playback.save_srt {
+                    Self::get_subtitle_path_for_media_uri(&path)
+                        .unwrap_or_else(|| self.paths.tmp_sub.with_extension("srt"))
+                } else {
+                    self.paths.tmp_sub.with_extension("srt")
+                };
                 info!("Subtitle will be saved to: {}", subtitle_path.display());
 
                 let _ = client.command(&["show-text", "STT: Starting local file transcription..."]);
@@ -411,12 +703,14 @@ impl PluginState {
 
                 // Create initial subtitles if this chunk hasn't been processed.
                 if !self.is_chunk_processed(self.current_pos_ms) {
-                    if self.process_chunk_local(client, &path, &subtitle_path) {
-                        if !self.subs_loaded {
-                            let _ = client.command(&["sub-add", subtitle_path.to_str().unwrap()]);
-                            self.subs_loaded = true;
-                        }
-                    }
+                    let remaining_ms = file_length_ms.saturating_sub(self.current_pos_ms);
+                    self.chunk_dur = self.local_chunk_size().min(remaining_ms).max(1);
+                    self.schedule_transcription(
+                        path.clone(),
+                        self.current_pos_ms,
+                        self.chunk_dur,
+                        Some(subtitle_path.clone()),
+                    );
                 }
 
                 info!(
@@ -424,13 +718,45 @@ impl PluginState {
                     path, file_length_ms, self.current_pos_ms
                 );
             } else {
-                let _ = client.command(&["show-text", "STT: Failed to get file info"]);
+                self.running = false;
+                self.mode = None;
+                warn!("Cannot start STT: no playable media path/duration is available");
+                let _ = client.command(&[
+                    "show-text",
+                    "STT: Please open a playable media file first",
+                    "4000",
+                ]);
             }
         }
     }
 
     /// Main processing loop - called on each event loop iteration
     fn tick(&mut self, client: &mut Handle) {
+        if self.shutting_down {
+            return;
+        }
+
+        if !self.running {
+            if self.transcription_complete {
+                let subtitle_path = match &self.mode {
+                    Some(ProcessingMode::Network) => self
+                        .network_cache
+                        .as_ref()
+                        .map(|cache| cache.subtitle_path.clone()),
+                    Some(ProcessingMode::Local { subtitle_path, .. }) => {
+                        Some(subtitle_path.clone())
+                    }
+                    None => None,
+                };
+                self.process_translation_results(client, subtitle_path.as_deref());
+            }
+            return;
+        }
+
+        if self.pending_transcription.is_some() && self.check_seek(client) {
+            return;
+        }
+        self.poll_transcription(client);
         if !self.running || self.shutting_down {
             return;
         }
@@ -498,88 +824,38 @@ impl PluginState {
             // No lookahead limit; we rely on cache availability below
         }
 
-        let max_chunk_ms = chunk_ms;
-        let first_chunk_ms = max_chunk_ms;
-        let chunks_to_process = self.config.prefetch.lookahead_chunks.max(1);
-        let lookahead_limit_ms = max_chunk_ms.saturating_mul(chunks_to_process as u64);
-        let playback_pos_ms = self.last_playback_pos_ms;
-        for i in 0..chunks_to_process {
-            if self.check_seek(client) {
+        if self.pending_transcription.is_some() {
+            return;
+        }
+
+        while self.is_chunk_processed(self.current_pos_ms) {
+            self.current_pos_ms = self.current_pos_ms.saturating_add(chunk_ms);
+        }
+
+        let chunk_end_ms = self.current_pos_ms.saturating_add(chunk_ms);
+        let lookahead_limit_ms =
+            chunk_ms.saturating_mul(self.config.prefetch.lookahead_chunks.max(1) as u64);
+        if let Some(playback_pos_ms) = self.last_playback_pos_ms {
+            let ahead_end_ms = chunk_end_ms.saturating_sub(playback_pos_ms);
+            if ahead_end_ms > lookahead_limit_ms {
+                trace!(
+                    "Look-ahead limit reached: chunk end {}ms ahead (limit {}ms); waiting",
+                    ahead_end_ms, lookahead_limit_ms
+                );
                 return;
             }
-            let chunk_start_ms = self.current_pos_ms + (i as u64 * max_chunk_ms);
-            let chunk_ms = if i == 0 { first_chunk_ms } else { max_chunk_ms };
-            let chunk_end_ms = chunk_start_ms + chunk_ms;
-
-            if let Some(playback_pos_ms) = playback_pos_ms {
-                let ahead_end_ms = chunk_end_ms.saturating_sub(playback_pos_ms);
-                if ahead_end_ms > lookahead_limit_ms {
-                    trace!(
-                        "Look-ahead limit reached: chunk end {}ms ahead (limit {}ms); waiting",
-                        ahead_end_ms, lookahead_limit_ms
-                    );
-                    break;
-                }
-            }
-
-            // Check if this chunk is fully cached
-            if chunk_end_ms > cache_end_ms {
-                if i == 0 {
-                    // Current chunk not cached, wait
-                    trace!(
-                        "Waiting for more cache: need {}ms, have {}ms",
-                        chunk_end_ms, cache_end_ms
-                    );
-                } else {
-                    // Future chunks not cached yet, that's fine
-                    trace!(
-                        "Look-ahead: chunk {} not cached yet (need {}ms, have {}ms)",
-                        i + 1,
-                        chunk_end_ms,
-                        cache_end_ms
-                    );
-                }
-                break; // Stop processing future chunks
-            }
-
-            // This chunk is cached, process it
-            if i == 0 {
-                debug!("Processing network chunk at {}ms", self.current_pos_ms);
-            } else {
-                debug!(
-                    "Look-ahead: processing chunk {} at {}ms",
-                    i + 1,
-                    chunk_start_ms
-                );
-            }
-
-            let start_ms = self.current_pos_ms;
-            if self.is_chunk_processed(start_ms) {
-                self.current_pos_ms = self.current_pos_ms.saturating_add(chunk_ms);
-                continue;
-            }
-
-            if self.process_chunk(client, chunk_ms, subtitle_path.as_deref()) {
-                self.current_pos_ms += chunk_ms;
-
-                if !self.subs_loaded {
-                    let main_srt = subtitle_path
-                        .clone()
-                        .unwrap_or_else(|| self.paths.tmp_sub.with_extension("srt"));
-                    let _ = client.command(&["sub-add", main_srt.to_str().unwrap()]);
-                    self.subs_loaded = true;
-                }
-
-                if self.config.playback.show_progress && i == 0 {
-                    let _ = client.command(&[
-                        "show-text",
-                        &format!("STT: {}", Self::format_progress(self.current_pos_ms)),
-                    ]);
-                }
-            } else {
-                break; // Stop if processing failed
-            }
         }
+
+        if chunk_end_ms > cache_end_ms {
+            trace!(
+                "Waiting for more cache: need {}ms, have {}ms",
+                chunk_end_ms, cache_end_ms
+            );
+            return;
+        }
+
+        debug!("Scheduling network chunk at {}ms", self.current_pos_ms);
+        self.process_chunk(client, chunk_ms, subtitle_path.as_deref());
     }
 
     fn tick_local(
@@ -613,78 +889,49 @@ impl PluginState {
         }
 
         if time_left > 0 {
-            // Look-ahead processing: process multiple chunks ahead (always enabled)
-            let chunks_to_process = self.config.prefetch.lookahead_chunks.max(1);
-            let lookahead_limit_ms = local_chunk_size.saturating_mul(chunks_to_process as u64);
-            let playback_pos_ms = self.last_playback_pos_ms;
+            if self.pending_transcription.is_some() {
+                return;
+            }
 
-            for i in 0..chunks_to_process {
-                if self.check_seek(client) {
+            while self.is_chunk_processed(self.current_pos_ms) {
+                self.current_pos_ms = self.current_pos_ms.saturating_add(local_chunk_size);
+                if self.current_pos_ms >= file_length_ms {
                     return;
                 }
-                let chunk_pos = self.current_pos_ms + (i as u64 * self.chunk_dur);
-                let chunk_end_ms = chunk_pos.saturating_add(self.chunk_dur);
-                if let Some(playback_pos_ms) = playback_pos_ms {
-                    let ahead_end_ms = chunk_end_ms.saturating_sub(playback_pos_ms);
-                    if ahead_end_ms > lookahead_limit_ms {
-                        trace!(
-                            "Look-ahead limit reached: chunk end {}ms ahead (limit {}ms); waiting",
-                            ahead_end_ms, lookahead_limit_ms
-                        );
-                        break;
-                    }
-                }
-                if chunk_pos >= file_length_ms {
-                    break; // Don't process beyond file end
-                }
+            }
 
-                // Process current chunk
-                if i == 0 {
-                    debug!(
-                        "Processing local chunk at {}ms, remaining: {}ms",
-                        self.current_pos_ms, time_left
+            let lookahead_limit_ms = local_chunk_size
+                .saturating_mul(self.config.prefetch.lookahead_chunks.max(1) as u64);
+            let chunk_end_ms = self.current_pos_ms.saturating_add(self.chunk_dur);
+            if let Some(playback_pos_ms) = self.last_playback_pos_ms {
+                let ahead_end_ms = chunk_end_ms.saturating_sub(playback_pos_ms);
+                if ahead_end_ms > lookahead_limit_ms {
+                    trace!(
+                        "Look-ahead limit reached: chunk end {}ms ahead (limit {}ms); waiting",
+                        ahead_end_ms, lookahead_limit_ms
                     );
-                } else {
-                    debug!("Look-ahead: processing chunk {} at {}ms", i + 1, chunk_pos);
-                }
-
-                let start_ms = self.current_pos_ms;
-                if self.is_chunk_processed(start_ms) {
-                    self.current_pos_ms = self.current_pos_ms.saturating_add(self.chunk_dur);
-                    continue;
-                }
-
-                if self.process_chunk_local(client, media_path, subtitle_path) {
-                    self.current_pos_ms += self.chunk_dur;
-
-                    if self.config.playback.show_progress && i == 0 {
-                        let _ = client.command(&[
-                            "show-text",
-                            &format!("STT: {}", Self::format_progress(self.current_pos_ms)),
-                        ]);
-                    }
-                } else {
-                    break; // Stop if processing failed
-                }
-
-                // Update remaining time for next iteration
-                let new_time_left = if file_length_ms > self.current_pos_ms {
-                    file_length_ms - self.current_pos_ms
-                } else {
-                    0
-                };
-                if new_time_left == 0 {
-                    break;
+                    return;
                 }
             }
+
+            debug!(
+                "Scheduling local chunk at {}ms, remaining: {}ms",
+                self.current_pos_ms, time_left
+            );
+            self.process_chunk_local(media_path, subtitle_path);
         } else {
             // Finished processing
-            info!("Finished processing local file");
-            let msg = format!("STT: Saved subtitles to {}", subtitle_path.display());
-            let _ = client.command(&["show-text", &msg, "5000"]);
-
-            self.running = false;
-            self.cleanup(client);
+            if !self.transcription_complete {
+                info!("Finished processing local file");
+                let msg = if self.config.playback.save_srt {
+                    format!("STT: Saved subtitles to {}", subtitle_path.display())
+                } else {
+                    "STT: Transcription complete".to_string()
+                };
+                let _ = client.command(&["show-text", &msg, "5000"]);
+                self.running = false;
+                self.transcription_complete = true;
+            }
         }
     }
 
@@ -747,8 +994,8 @@ impl PluginState {
                 // Keep existing subtitles, just update processing cursor.
                 self.current_pos_ms = new_pos;
                 self.cancel_translation_inflight();
-                self.stt_runner.cancel_inflight();
-                self.audio_extractor.cancel_inflight();
+                self.transcription_worker.cancel_inflight();
+                self.pending_transcription = None;
                 if self.is_chunk_processed(new_pos) {
                     self.enqueue_missing_translations_for_chunk(new_pos);
                 }
@@ -768,8 +1015,8 @@ impl PluginState {
 
                 self.current_pos_ms = new_pos;
                 self.cancel_translation_inflight();
-                self.stt_runner.cancel_inflight();
-                self.audio_extractor.cancel_inflight();
+                self.transcription_worker.cancel_inflight();
+                self.pending_transcription = None;
                 if self.is_chunk_processed(new_pos) {
                     self.enqueue_missing_translations_for_chunk(new_pos);
                 }
@@ -803,72 +1050,38 @@ impl PluginState {
             return false;
         }
 
-        // Extract audio from cache
-        let wav_ms = chunk_ms;
-        if !self.create_wav(self.paths.tmp_cache.to_str().unwrap(), 0, wav_ms) {
-            return false;
-        }
-
-        self.transcribe_and_update(client, subtitle_path, chunk_ms)
+        self.schedule_transcription(
+            self.paths.tmp_cache.to_string_lossy().into_owned(),
+            0,
+            chunk_ms,
+            subtitle_path.map(Path::to_path_buf),
+        )
     }
 
     /// Process one chunk from local file
-    fn process_chunk_local(
-        &mut self,
-        client: &mut Handle,
-        media_path: &str,
-        subtitle_path: &Path,
-    ) -> bool {
-        // Extract audio directly from local file
-        if !self.create_wav(media_path, self.current_pos_ms, self.chunk_dur) {
-            return false;
-        }
-
-        self.transcribe_and_update(client, Some(subtitle_path), self.chunk_dur)
+    fn process_chunk_local(&mut self, media_path: &str, subtitle_path: &Path) -> bool {
+        self.schedule_transcription(
+            media_path.to_string(),
+            self.current_pos_ms,
+            self.chunk_dur,
+            Some(subtitle_path.to_path_buf()),
+        )
     }
 
-    /// Common transcription and subtitle update logic
-    fn transcribe_and_update(
+    /// Apply a completed worker result on the mpv event thread.
+    fn apply_transcription_result(
         &mut self,
         client: &mut Handle,
         subtitle_path: Option<&Path>,
-        chunk_ms: u64,
+        chunk_start_ms: u64,
+        device_notice: Option<SttDeviceNotice>,
     ) -> bool {
-        if self.check_seek(client) {
-            return false;
-        }
-
         let tmp_sub_prefix = self.paths.tmp_sub.to_string_lossy().to_string();
         let append_path = format!("{}_append", &tmp_sub_prefix);
         let main_srt = subtitle_path
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| self.paths.tmp_sub.with_extension("srt"));
-
-        trace!("Starting STT transcription for current chunk");
-        // Run STT transcription
-        if let Err(e) = self.stt_runner.transcribe(
-            self.paths.tmp_wav.to_str().unwrap(),
-            append_path.as_str(),
-            chunk_ms,
-        ) {
-            if matches!(e, MpvSttError::SttCancelled) {
-                debug!("STT transcription cancelled");
-            } else {
-                error!("STT transcription failed: {}", e);
-                let msg = format!("STT failed: {e}");
-                let _ = client.command(&["show-text", &msg, "4000"]);
-                // Hard stop: backend failed, keep plugin idle as requested.
-                self.running = false;
-                self.cleanup(client);
-            }
-            return false;
-        }
-        self.show_device_notice(client);
-        if self.check_seek(client) {
-            debug!("Seek detected during transcription; dropping interim results");
-            self.paths.cleanup_intermediate_subs();
-            return false;
-        }
+        self.show_device_notice(client, device_notice);
 
         // Offset timestamps
         let append_srt = format!("{}.srt", append_path);
@@ -878,16 +1091,15 @@ impl PluginState {
             if meta.len() == 0 {
                 info!(
                     "Chunk starting at {}ms produced no subtitles; skipping merge",
-                    self.current_pos_ms
+                    chunk_start_ms
                 );
-                self.mark_chunk_processed(self.current_pos_ms);
+                self.mark_chunk_processed(chunk_start_ms);
                 self.paths.cleanup_intermediate_subs();
                 return true;
             }
         }
 
-        if let Err(e) =
-            crate::srt::offset_srt_file(&append_srt, &offset_srt, self.current_pos_ms as i64)
+        if let Err(e) = crate::srt::offset_srt_file(&append_srt, &offset_srt, chunk_start_ms as i64)
         {
             error!("SRT offset failed: {}", e);
             return false;
@@ -899,7 +1111,7 @@ impl PluginState {
             Err(_) => return false,
         };
         self.subtitle_manager.add_from_srt(&srt_file);
-        self.mark_chunk_processed(self.current_pos_ms);
+        self.mark_chunk_processed(chunk_start_ms);
 
         let mut pending_tasks = Vec::new();
         let mut already_translated = 0usize;
@@ -957,8 +1169,8 @@ impl PluginState {
         true
     }
 
-    fn show_device_notice(&mut self, client: &mut Handle) {
-        let Some(notice) = self.stt_runner.take_device_notice() else {
+    fn show_device_notice(&mut self, client: &mut Handle, device_notice: Option<SttDeviceNotice>) {
+        let Some(notice) = device_notice else {
             return;
         };
 
@@ -1019,38 +1231,20 @@ impl PluginState {
         true
     }
 
-    fn create_wav(&self, media_path: &str, start_ms: u64, duration_ms: u64) -> bool {
-        let result = self.audio_extractor.extract_audio_segment(
-            media_path,
-            self.paths.tmp_wav.to_str().unwrap(),
-            start_ms,
-            duration_ms,
-        );
+    /// Stop the current media/transcription session while keeping the plugin
+    /// alive. This path is used by the toggle, EndFile, completed media and
+    /// recoverable STT errors, so it must remain restartable.
+    fn stop_transcription(&mut self) {
+        debug!("Stopping current transcription and cleaning up session state");
 
-        match result {
-            Ok(_) => true,
-            Err(MpvSttError::AudioExtractionCancelled) => {
-                debug!("Audio extraction cancelled");
-                false
-            }
-            Err(e) => {
-                error!("Audio extraction failed: {}", e);
-                false
-            }
-        }
-    }
+        self.running = false;
+        self.transcription_worker.cancel_inflight();
+        self.pending_transcription = None;
 
-    fn cleanup(&mut self, _client: &mut Handle) {
-        debug!("Cleaning up temporary files and state");
-
-        // Set shutting down flag to stop any ongoing processing
-        self.shutting_down = true;
-        self.stt_runner.cancel_inflight();
-        self.audio_extractor.cancel_inflight();
-
-        // Shutdown async translation queue if it exists
-        if let Some(ref mut queue) = self.async_translation_queue {
-            queue.force_shutdown();
+        // Cancel tasks belonging to this media, but keep the worker alive so
+        // Ctrl+Shift+S and the next file can start a fresh session.
+        if let Some(queue) = self.async_translation_queue.as_ref() {
+            queue.cancel_inflight();
         }
 
         self.paths.cleanup();
@@ -1063,6 +1257,22 @@ impl PluginState {
         self.last_playback_pos_ms = None;
         self.last_playback_instant = None;
         self.mode = None;
+        self.transcription_complete = false;
+    }
+
+    /// Permanently shut down resources immediately before the mpv client is
+    /// destroyed. Unlike `stop_transcription`, this is terminal.
+    fn shutdown(&mut self) {
+        if self.shutting_down {
+            return;
+        }
+
+        self.shutting_down = true;
+        self.stop_transcription();
+        self.transcription_worker.shutdown();
+        if let Some(mut queue) = self.async_translation_queue.take() {
+            queue.shutdown();
+        }
     }
 
     fn format_progress(ms: u64) -> String {
@@ -1286,6 +1496,12 @@ impl PluginState {
     }
 }
 
+impl Drop for PluginState {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
 /// MPV C plugin entry point
 #[unsafe(no_mangle)]
 pub extern "C" fn mpv_open_cplugin(handle: *mut mpv_handle) -> std::os::raw::c_int {
@@ -1294,13 +1510,6 @@ pub extern "C" fn mpv_open_cplugin(handle: *mut mpv_handle) -> std::os::raw::c_i
 
     let result = std::panic::catch_unwind(|| {
         init_logger();
-
-        // Dump all environment variables at trace level (use MPV_STT_PLUGIN_RS_LOG=trace to see).
-        let env_dump = env::vars()
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect::<Vec<_>>()
-            .join("; ");
-        info!("Env (all): {}", env_dump);
 
         let client = Handle::from_ptr(handle);
 
@@ -1320,24 +1529,94 @@ pub extern "C" fn mpv_open_cplugin(handle: *mut mpv_handle) -> std::os::raw::c_i
             env_cfg_path.as_ref().map(|p| p.display().to_string()),
             default_cfg_path.as_ref().map(|p| p.display().to_string())
         );
-        info!("Effective config: {:?}", config);
-        let auto_start = config.playback.auto_start;
-        let mut state = PluginState::new(config);
-
-        // Get client name first
-        let client_name = client.name().to_string();
-
-        // Register key bindings (multi-line define-section contents; each line
-        // is one key -> script-message-to mapping). The letter is the mnemonic:
-        // s=subtitles, t=translate, c=cache.
-        let key_bindings = format!(
-            "Ctrl+Shift+s script-message-to {} toggle-stt\nCtrl+Shift+t script-message-to {} toggle-translate\nCtrl+Shift+c script-message-to {} clear-cache",
-            client_name, client_name, client_name
+        // Deliberately log only non-secret fields. The full Config debug value
+        // contains API/encryption/auth keys and must never be written to IINA's
+        // logs.
+        info!(
+            "Effective config: stt.backend={}, stt.model={}, stt.language={}, translate.backend={}, translate.languages={}->{}, chunks={}ms/{}ms, auto_start={}, save_srt={}",
+            config.stt.backend,
+            match config.stt.backend {
+                crate::config::BackendKind::Ferrum => config
+                    .stt
+                    .ferrum
+                    .as_ref()
+                    .map(|cfg| cfg.model.as_str())
+                    .unwrap_or("<missing>"),
+                crate::config::BackendKind::OpenAi => config
+                    .stt
+                    .openai
+                    .as_ref()
+                    .map(|cfg| cfg.model.as_str())
+                    .unwrap_or("<missing>"),
+            },
+            match config.stt.backend {
+                crate::config::BackendKind::Ferrum => config
+                    .stt
+                    .ferrum
+                    .as_ref()
+                    .and_then(|cfg| cfg.language.as_deref())
+                    .unwrap_or("auto"),
+                crate::config::BackendKind::OpenAi => config
+                    .stt
+                    .openai
+                    .as_ref()
+                    .and_then(|cfg| cfg.language.as_deref())
+                    .unwrap_or("auto"),
+            },
+            config.translate.backend,
+            config.translate.from_lang,
+            config.translate.to_lang,
+            config.chunk.local_ms,
+            config.chunk.network_ms,
+            config.playback.auto_start,
+            config.playback.save_srt,
         );
+        let auto_start = config.playback.auto_start;
+        let mut state = match PluginState::new(config) {
+            Ok(state) => state,
+            Err(err) => {
+                error!("Failed to initialize STT plugin: {err}");
+                let _ = client.command(&[
+                    "show-text",
+                    &format!("STT plugin initialization failed: {err}"),
+                    "8000",
+                ]);
+                return -1;
+            }
+        };
+
+        // Target the numeric client ID rather than a filename-derived name.
+        // IINA can create multiple mpv cores and mpv may suffix duplicate
+        // client names; IDs are unambiguous for the lifetime of this client.
+        let client_name = client.name().to_string();
+        let client_target = format!("@{}", client.id());
+
+        // Use a forced section so IINA/default input bindings cannot silently
+        // shadow the plugin controls. Users explicitly chose these shortcuts.
+        let key_bindings = key_binding_section(&client_target);
         let section_name = format!("{}-input", client_name);
 
-        let _ = client.command(&["define-section", &section_name, &key_bindings, "default"]);
-        let _ = client.command(&["enable-section", &section_name]);
+        if let Err(err) = client.command(&["define-section", &section_name, &key_bindings, "force"])
+        {
+            error!("Failed to define input section {section_name}: {err}");
+            let _ = client.command(&[
+                "show-text",
+                "STT plugin: failed to register shortcuts (see log)",
+                "5000",
+            ]);
+        } else if let Err(err) = client.command(&["enable-section", &section_name]) {
+            error!("Failed to enable input section {section_name}: {err}");
+            let _ = client.command(&[
+                "show-text",
+                "STT plugin: failed to enable shortcuts (see log)",
+                "5000",
+            ]);
+        } else {
+            info!(
+                "Registered forced shortcuts for client {} (target {}): Ctrl+Shift+S/T/C",
+                client_name, client_target
+            );
+        }
 
         // Set auto-start flag (will start after file loads)
         if auto_start {
@@ -1363,9 +1642,7 @@ pub extern "C" fn mpv_open_cplugin(handle: *mut mpv_handle) -> std::os::raw::c_i
             match client.wait_event(0.1) {
                 Event::Shutdown => {
                     info!("Shutting down...");
-                    state.shutting_down = true;
-                    state.running = false;
-                    state.cleanup(client);
+                    state.shutdown();
                     info!("Shutdown complete");
                     return 0;
                 }
@@ -1374,34 +1651,19 @@ pub extern "C" fn mpv_open_cplugin(handle: *mut mpv_handle) -> std::os::raw::c_i
                         continue;
                     }
                     let args = msg.args();
-                    if !args.is_empty() {
-                        let command = if args[0] == "toggle-stt" {
-                            Some("toggle-stt")
-                        } else if args[0] == "toggle-translate" {
-                            Some("toggle-translate")
-                        } else if args[0] == "clear-cache" {
-                            Some("clear-cache")
-                        } else if args.len() > 1 && args[1] == "toggle-stt" {
-                            Some("toggle-stt")
-                        } else {
-                            None
-                        };
-
-                        if let Some(command) = command {
-                            match command {
-                                "toggle-stt" => {
-                                    debug!("Toggling STT...");
-                                    state.toggle_stt(client);
-                                }
-                                "toggle-translate" => {
-                                    debug!("Toggling translation...");
-                                    state.toggle_translate(client);
-                                }
-                                "clear-cache" => {
-                                    debug!("Clearing subtitle cache...");
-                                    state.clear_cache(client);
-                                }
-                                _ => {}
+                    if let Some(command) = ControlCommand::from_client_message(&args) {
+                        match command {
+                            ControlCommand::ToggleStt => {
+                                debug!("Toggling STT...");
+                                state.toggle_stt(client);
+                            }
+                            ControlCommand::ToggleTranslate => {
+                                debug!("Toggling translation...");
+                                state.toggle_translate(client);
+                            }
+                            ControlCommand::ClearCache => {
+                                debug!("Clearing subtitle cache...");
+                                state.clear_cache(client);
                             }
                         }
                     }
@@ -1411,6 +1673,11 @@ pub extern "C" fn mpv_open_cplugin(handle: *mut mpv_handle) -> std::os::raw::c_i
                         continue;
                     }
                     debug!("StartFile event received");
+                    // Be defensive if a frontend switches files without an
+                    // EndFile event reaching this client.
+                    if state.running || state.mode.is_some() {
+                        state.stop_transcription();
+                    }
                     state.file_loaded = false;
                     state.pending_auto_start = state.config.playback.auto_start;
                 }
@@ -1446,9 +1713,8 @@ pub extern "C" fn mpv_open_cplugin(handle: *mut mpv_handle) -> std::os::raw::c_i
                     state.tick(client);
                 }
                 Event::EndFile(_) => {
-                    if state.running && !state.shutting_down {
-                        state.running = false;
-                        state.cleanup(client);
+                    if !state.shutting_down && (state.running || state.mode.is_some()) {
+                        state.stop_transcription();
                     }
                     state.file_loaded = false; // Reset for next file
                 }
@@ -1535,5 +1801,129 @@ fn init_logger() {
         )
         .format_timestamp_millis()
         .try_init();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+    use std::net::TcpListener;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn control_messages_support_all_shortcuts_and_legacy_shape() {
+        assert_eq!(
+            ControlCommand::from_client_message(&["toggle-stt"]),
+            Some(ControlCommand::ToggleStt)
+        );
+        assert_eq!(
+            ControlCommand::from_client_message(&["toggle-translate"]),
+            Some(ControlCommand::ToggleTranslate)
+        );
+        assert_eq!(
+            ControlCommand::from_client_message(&["clear-cache"]),
+            Some(ControlCommand::ClearCache)
+        );
+        assert_eq!(
+            ControlCommand::from_client_message(&["legacy-route", "toggle-translate"]),
+            Some(ControlCommand::ToggleTranslate)
+        );
+        assert_eq!(ControlCommand::from_client_message(&["unknown"]), None);
+    }
+
+    #[test]
+    fn key_section_targets_the_exact_mpv_client() {
+        let section = key_binding_section("@42");
+        assert_eq!(section.lines().count(), KEY_BINDINGS.len());
+        for (key, command) in KEY_BINDINGS {
+            assert!(
+                section.contains(&format!("{key} script-message-to @42 {command}")),
+                "missing {key}/{command} binding in {section:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn stopping_a_session_does_not_permanently_shutdown_the_plugin() {
+        let mut state = PluginState::new(Config::default()).unwrap();
+        state.running = true;
+        state.mode = Some(ProcessingMode::Network);
+
+        state.stop_transcription();
+
+        assert!(!state.running);
+        assert!(!state.shutting_down);
+        assert!(state.mode.is_none());
+        assert!(
+            state.async_translation_queue.is_some(),
+            "the translation worker must remain available for the next start"
+        );
+
+        // A terminal shutdown is deliberately separate and idempotent.
+        state.shutdown();
+        state.shutdown();
+        assert!(state.shutting_down);
+        assert!(state.async_translation_queue.is_none());
+    }
+
+    #[test]
+    fn transcription_worker_cancels_a_blocked_stt_request_promptly() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (request_seen_tx, request_seen_rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut byte = [0u8; 1];
+            let _ = stream.read(&mut byte);
+            let _ = request_seen_tx.send(());
+            thread::sleep(Duration::from_secs(2));
+        });
+
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join("input.wav");
+        let output_wav = temp.path().join("chunk.wav");
+        let output_prefix = temp.path().join("subs_append");
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&input, spec).unwrap();
+        for _ in 0..1_600 {
+            writer.write_sample(0i16).unwrap();
+        }
+        writer.finalize().unwrap();
+
+        let mut config = Config::default();
+        let openai = config.stt.openai.as_mut().unwrap();
+        openai.server_addr = format!("http://{addr}");
+        openai.timeout_ms = 30_000;
+        openai.max_retry = 1;
+        let audio = AudioExtractor::default().with_ffmpeg_timeout(5_000);
+        let stt = SttRunner::from_config(&config.stt).unwrap();
+        let mut worker = TranscriptionWorker::new(audio, stt);
+        worker
+            .submit(
+                input.to_string_lossy().into_owned(),
+                0,
+                100,
+                output_wav,
+                output_prefix,
+            )
+            .expect("failed to submit transcription job");
+        request_seen_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("STT worker never started the request");
+
+        let started = Instant::now();
+        worker.shutdown();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "worker shutdown waited for the blocked STT request: {:?}",
+            started.elapsed()
+        );
+        assert!(worker.worker_handle.is_none());
     }
 }

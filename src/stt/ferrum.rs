@@ -1,13 +1,13 @@
 use super::{BackendKind, SttBackend, SttDeviceNotice};
-use log::{debug, trace};
 use crate::common::{MpvSttError, Result};
 use crate::crypto::{AuthToken, EncryptionKey};
 use crate::srt::SrtFile;
+use libc;
+use log::{debug, trace};
 use opusic_sys as opus;
-use reqwest::blocking::Client;
+use reqwest::Client;
 use reqwest::header::{HeaderMap, HeaderValue};
 use std::path::{Path, PathBuf};
-use libc;
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -105,8 +105,16 @@ impl FerrumBackend {
         }
 
         let request_id = self.generate_request_id();
-        let srt_data =
-            self.send_request_with_retry(request_id, &audio_data, duration_ms, run_generation)?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| MpvSttError::SttFailed(format!("Async runtime build failed: {e}")))?;
+        let srt_data = runtime.block_on(self.send_request_with_retry(
+            request_id,
+            &audio_data,
+            duration_ms,
+            run_generation,
+        ))?;
 
         if self.cancel_generation.load(Ordering::Relaxed) != run_generation {
             return Err(MpvSttError::SttCancelled);
@@ -134,7 +142,7 @@ impl FerrumBackend {
             .as_nanos() as u64
     }
 
-    fn send_request_with_retry(
+    async fn send_request_with_retry(
         &self,
         request_id: u64,
         audio: &[u8],
@@ -142,19 +150,29 @@ impl FerrumBackend {
         run_generation: u64,
     ) -> Result<Vec<u8>> {
         let mut last_error = None;
+        let max_attempts = self.config.max_retry.max(1);
 
-        for attempt in 0..self.config.max_retry {
+        for attempt in 0..max_attempts {
             if self.cancel_generation.load(Ordering::Relaxed) != run_generation {
                 return Err(MpvSttError::SttCancelled);
             }
 
-            match self.send_request(request_id, audio, duration_ms, run_generation) {
+            match self
+                .send_request(request_id, audio, duration_ms, run_generation)
+                .await
+            {
                 Ok(result) => return Ok(result),
                 Err(e) => {
                     last_error = Some(e);
-                    if attempt + 1 < self.config.max_retry {
+                    if attempt + 1 < max_attempts {
                         debug!("HTTP request attempt {} failed, retrying...", attempt + 1);
-                        std::thread::sleep(Duration::from_millis(500));
+                        tokio::select! {
+                            () = tokio::time::sleep(Duration::from_millis(500)) => {}
+                            () = Self::wait_for_cancellation(
+                                &self.cancel_generation,
+                                run_generation,
+                            ) => return Err(MpvSttError::SttCancelled),
+                        }
                     }
                 }
             }
@@ -163,7 +181,7 @@ impl FerrumBackend {
         Err(last_error.unwrap())
     }
 
-    fn send_request(
+    async fn send_request(
         &self,
         request_id: u64,
         audio: &[u8],
@@ -200,10 +218,7 @@ impl FerrumBackend {
         } else {
             COMPRESSION_PCM
         };
-        headers.insert(
-            HEADER_COMPRESSION,
-            HeaderValue::from_static(compression),
-        );
+        headers.insert(HEADER_COMPRESSION, HeaderValue::from_static(compression));
         if encrypted {
             headers.insert(HEADER_ENCRYPTED, HeaderValue::from_static("1"));
         }
@@ -221,34 +236,43 @@ impl FerrumBackend {
         }
 
         let wall_start = Instant::now();
-        let response = self
+        let request = self
             .client
             .post(format!("{}/transcribe", self.server_url))
             .headers(headers)
-            .body(payload)
-            .send()
-            .map_err(|e| MpvSttError::SttFailed(format!("HTTP send failed: {}", e)))?;
+            .body(payload);
+        let request_future = async {
+            let response = request
+                .send()
+                .await
+                .map_err(|e| MpvSttError::SttFailed(format!("HTTP send failed: {}", e)))?;
+            let status = response.status();
+            if !status.is_success() {
+                let text = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| "unknown error".to_string());
+                return Err(MpvSttError::SttFailed(format!(
+                    "Server error ({}): {}",
+                    status, text
+                )));
+            }
 
-        if self.cancel_generation.load(Ordering::Relaxed) != run_generation {
-            return Err(MpvSttError::SttCancelled);
-        }
-
-        let status = response.status();
-        if !status.is_success() {
-            let text = response
-                .text()
-                .unwrap_or_else(|_| "unknown error".to_string());
-            return Err(MpvSttError::SttFailed(format!(
-                "Server error ({}): {}",
-                status, text
-            )));
-        }
-
-        let response_headers = response.headers().clone();
-        let mut data = response
-            .bytes()
-            .map_err(|e| MpvSttError::SttFailed(format!("HTTP body read failed: {}", e)))?
-            .to_vec();
+            let response_headers = response.headers().clone();
+            let data = response
+                .bytes()
+                .await
+                .map_err(|e| MpvSttError::SttFailed(format!("HTTP body read failed: {}", e)))?
+                .to_vec();
+            Ok((response_headers, data))
+        };
+        let (response_headers, mut data) = tokio::select! {
+            result = request_future => result?,
+            () = Self::wait_for_cancellation(
+                &self.cancel_generation,
+                run_generation,
+            ) => return Err(MpvSttError::SttCancelled),
+        };
         let raw_resp_len = data.len();
 
         if encrypted {
@@ -286,6 +310,15 @@ impl FerrumBackend {
         );
 
         Ok(data)
+    }
+
+    async fn wait_for_cancellation(cancel_generation: &AtomicU64, run_generation: u64) {
+        loop {
+            if cancel_generation.load(Ordering::Acquire) != run_generation {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
     }
 
     fn compress_audio<P: AsRef<Path>>(&self, audio_path: P) -> Result<Vec<u8>> {
@@ -407,7 +440,9 @@ fn opus_error(code: libc::c_int) -> String {
         if cstr.is_null() {
             format!("Opus error {}", code)
         } else {
-            std::ffi::CStr::from_ptr(cstr).to_string_lossy().into_owned()
+            std::ffi::CStr::from_ptr(cstr)
+                .to_string_lossy()
+                .into_owned()
         }
     }
 }
@@ -444,6 +479,10 @@ impl SttBackend for FerrumBackend {
 
     fn cancel_inflight(&self) {
         self.cancel_generation.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn cancellation_generation(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.cancel_generation)
     }
 
     fn take_device_notice(&mut self) -> Option<SttDeviceNotice> {
