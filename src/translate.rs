@@ -1,13 +1,13 @@
+use crate::common::{MpvSttError, Result};
 use crate::config::TranslateBackendKind;
+use crate::srt::SrtFile;
 use futures::stream::StreamExt;
 use log::{debug, trace, warn};
-use crate::common::{MpvSttError, Result};
-use crate::srt::SrtFile;
 use std::path::Path;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{
     Arc,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::thread;
 use std::time::Duration;
@@ -264,22 +264,28 @@ struct QueuedTask {
     task: TranslationTask,
 }
 
+#[derive(Debug, Clone)]
+struct QueuedResult {
+    generation: u64,
+    result: TranslationResult,
+}
+
 /// Async translation queue that processes translations in background
 pub struct AsyncTranslationQueue {
     task_sender: Sender<Option<QueuedTask>>,
-    result_receiver: Receiver<TranslationResult>,
+    result_receiver: Receiver<QueuedResult>,
     worker_handle: Option<thread::JoinHandle<()>>,
-    shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
+    shutdown_flag: Arc<AtomicBool>,
     generation: Arc<AtomicU64>,
 }
 
 impl AsyncTranslationQueue {
     pub fn new(config: TranslatorConfig) -> Self {
         let (task_sender, task_receiver) = channel::<Option<QueuedTask>>();
-        let (result_sender, result_receiver) = channel::<TranslationResult>();
+        let (result_sender, result_receiver) = channel::<QueuedResult>();
 
         let config = Arc::new(config);
-        let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
         let generation = Arc::new(AtomicU64::new(0));
         let shutdown_flag_clone = shutdown_flag.clone();
         let generation_clone = generation.clone();
@@ -317,29 +323,37 @@ impl AsyncTranslationQueue {
     /// Try to get completed translation results (non-blocking)
     pub fn try_recv_results(&self) -> Vec<TranslationResult> {
         let mut results = Vec::new();
-        while let Ok(result) = self.result_receiver.try_recv() {
-            results.push(result);
+        let generation = self.generation.load(Ordering::Acquire);
+        while let Ok(queued) = self.result_receiver.try_recv() {
+            if queued.generation == generation {
+                results.push(queued.result);
+            } else {
+                trace!(
+                    "Dropping stale translation result from generation {} (current {})",
+                    queued.generation, generation
+                );
+            }
         }
         results
     }
 
     /// Cancel any in-flight translation tasks without tearing down the worker.
     pub fn cancel_inflight(&self) {
-        self.generation.fetch_add(1, Ordering::Relaxed);
+        self.generation.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Worker thread that processes translation tasks in batches
     fn worker_thread(
         task_receiver: Receiver<Option<QueuedTask>>,
-        result_sender: Sender<TranslationResult>,
+        result_sender: Sender<QueuedResult>,
         config: Arc<TranslatorConfig>,
-        shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
+        shutdown_flag: Arc<AtomicBool>,
         generation: Arc<AtomicU64>,
         runtime: &tokio::runtime::Runtime,
     ) {
         loop {
             // Check shutdown flag
-            if shutdown_flag.load(std::sync::atomic::Ordering::Relaxed) {
+            if shutdown_flag.load(Ordering::Acquire) {
                 debug!("Translation worker thread shutting down due to shutdown flag");
                 return;
             }
@@ -412,9 +426,9 @@ impl AsyncTranslationQueue {
     /// Process translation tasks using the remote DeepL-compatible API
     fn process_remote(
         tasks: &[TranslationTask],
-        result_sender: &Sender<TranslationResult>,
+        result_sender: &Sender<QueuedResult>,
         config: &Arc<TranslatorConfig>,
-        shutdown_flag: &Arc<std::sync::atomic::AtomicBool>,
+        shutdown_flag: &Arc<AtomicBool>,
         generation: &Arc<AtomicU64>,
         task_generation: u64,
         runtime: &tokio::runtime::Runtime,
@@ -456,14 +470,18 @@ impl AsyncTranslationQueue {
             let mut futures = stream.buffer_unordered(concurrency);
 
             while let Some(result) = futures.next().await {
-                if shutdown_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                if shutdown_flag.load(Ordering::Acquire) {
                     break;
                 }
                 if generation.load(Ordering::Relaxed) != task_generation {
                     break;
                 }
                 if let Some(result) = result {
-                    if sender.send(result).is_err() {
+                    let queued = QueuedResult {
+                        generation: task_generation,
+                        result,
+                    };
+                    if sender.send(queued).is_err() {
                         debug!("Main thread dropped receiver, exiting");
                         break;
                     }
@@ -476,7 +494,7 @@ impl AsyncTranslationQueue {
     async fn translate_single_task_async(
         task: TranslationTask,
         config: Arc<TranslatorConfig>,
-        shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
+        shutdown_flag: Arc<AtomicBool>,
         generation: Arc<AtomicU64>,
         task_generation: u64,
         client: Arc<reqwest::Client>,
@@ -489,20 +507,32 @@ impl AsyncTranslationQueue {
 
         loop {
             // Check shutdown flag
-            if shutdown_flag.load(std::sync::atomic::Ordering::Relaxed) {
+            if shutdown_flag.load(Ordering::Acquire) {
                 return None;
             }
             if generation.load(Ordering::Relaxed) != task_generation {
                 return None;
             }
 
-            let translated = match config.backend {
-                TranslateBackendKind::DeepL => {
-                    deepl_translate_async(&client, &config, &from_lang, &to_lang, &task.text).await
+            let request = async {
+                match config.backend {
+                    TranslateBackendKind::DeepL => {
+                        deepl_translate_async(&client, &config, &from_lang, &to_lang, &task.text)
+                            .await
+                    }
+                    TranslateBackendKind::LibreTranslate => {
+                        libre_translate_async(&client, &config, &from_lang, &to_lang, &task.text)
+                            .await
+                    }
                 }
-                TranslateBackendKind::LibreTranslate => {
-                    libre_translate_async(&client, &config, &from_lang, &to_lang, &task.text).await
-                }
+            };
+            let translated = tokio::select! {
+                result = request => result,
+                () = Self::wait_for_cancellation(
+                    &shutdown_flag,
+                    &generation,
+                    task_generation,
+                ) => return None,
             };
             match translated {
                 Ok(translated) if !translated.trim().is_empty() => {
@@ -537,20 +567,46 @@ impl AsyncTranslationQueue {
                 return None;
             }
 
-            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_millis(delay_ms)) => {}
+                () = Self::wait_for_cancellation(
+                    &shutdown_flag,
+                    &generation,
+                    task_generation,
+                ) => return None,
+            }
             delay_ms = (delay_ms * 2).min(2_000);
         }
     }
 
-    /// Shutdown the worker thread gracefully
+    async fn wait_for_cancellation(
+        shutdown_flag: &AtomicBool,
+        generation: &AtomicU64,
+        task_generation: u64,
+    ) {
+        loop {
+            if shutdown_flag.load(Ordering::Acquire)
+                || generation.load(Ordering::Acquire) != task_generation
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// Cancel all work and join the worker before the containing dynamic
+    /// library can be unloaded.
     pub fn shutdown(&mut self) {
+        if self.worker_handle.is_none() {
+            return;
+        }
+
         debug!("Shutting down async translation queue");
-        // Send shutdown signal
+        self.shutdown_flag.store(true, Ordering::Release);
+        self.generation.fetch_add(1, Ordering::AcqRel);
         let _ = self.task_sender.send(None);
 
-        // Wait for worker thread to finish (with timeout)
         if let Some(handle) = self.worker_handle.take() {
-            // Try to join with a reasonable timeout
             match handle.join() {
                 Ok(_) => debug!("Translation worker thread shut down successfully"),
                 Err(_) => warn!("Translation worker thread panicked during shutdown"),
@@ -558,38 +614,17 @@ impl AsyncTranslationQueue {
         }
     }
 
-    /// Force immediate shutdown by disconnecting channels
+    /// Backwards-compatible alias for callers that used the old API.
     pub fn force_shutdown(&mut self) {
-        debug!("Force shutting down async translation queue");
-
-        // Set shutdown flag to kill any running crow processes
-        self.shutdown_flag
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-
-        // Send shutdown signal
-        let _ = self.task_sender.send(None);
-
-        // Wait briefly for worker thread to exit
-        if let Some(handle) = self.worker_handle.take() {
-            // Give it a short time to clean up
-            let _result = std::thread::spawn(move || handle.join());
-
-            // Wait max 500ms for graceful shutdown
-            std::thread::sleep(Duration::from_millis(500));
-
-            // If still running, just drop it (thread will be detached)
-            debug!("Translation worker shutdown completed");
-        }
+        self.shutdown();
     }
 }
 
 impl Drop for AsyncTranslationQueue {
     fn drop(&mut self) {
-        // Force immediate shutdown on drop
         if self.worker_handle.is_some() {
-            debug!("AsyncTranslationQueue dropped, forcing shutdown");
-            let _ = self.task_sender.send(None);
-            // Don't wait in Drop to avoid blocking
+            debug!("AsyncTranslationQueue dropped, shutting down worker");
+            self.shutdown();
         }
     }
 }
@@ -915,6 +950,43 @@ mod tests {
         assert_eq!(config.timeout_ms, 5000);
         assert_eq!(config.server_addr, "http://127.0.0.1:8000");
         assert_eq!(config.api_key, "k");
+    }
+
+    #[test]
+    fn async_queue_shutdown_cancels_a_blocked_request_and_joins_worker() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (request_seen_tx, request_seen_rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut byte = [0u8; 1];
+            let _ = stream.read(&mut byte);
+            let _ = request_seen_tx.send(());
+            // Deliberately keep the HTTP request pending. The queue must cancel
+            // its reqwest future instead of waiting for this server.
+            thread::sleep(Duration::from_secs(2));
+        });
+
+        let config = TranslatorConfig::new("en".to_string(), "zh".to_string())
+            .with_server_addr(format!("http://{addr}"))
+            .with_timeout_ms(30_000);
+        let mut queue = AsyncTranslationQueue::new(config);
+        queue.submit(TranslationTask {
+            start_ms: 0,
+            text: "hello".to_string(),
+        });
+        request_seen_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("translation worker never started the request");
+
+        let started = std::time::Instant::now();
+        queue.shutdown();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "shutdown waited for the blocked HTTP request: {:?}",
+            started.elapsed()
+        );
+        assert!(queue.worker_handle.is_none());
     }
 
     #[test]

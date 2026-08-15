@@ -27,7 +27,7 @@ log = "0.4.29"
 env_logger = "0.11.8"
 
 # Async runtime (translate.rs uses tokio::spawn + channels)
-tokio = { version = "1.48.0", features = ["rt", "net", "time"] }
+tokio = { version = "1.48.0", features = ["rt", "net", "time", "macros"] }
 futures = "0.3.31"
 
 # Audio processing

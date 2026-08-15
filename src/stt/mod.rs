@@ -1,6 +1,7 @@
-use crate::config::SttConfig;
 use crate::common::Result;
+use crate::config::SttConfig;
 use std::path::Path;
+use std::sync::{Arc, atomic::AtomicU64};
 
 pub use crate::config::BackendKind;
 
@@ -17,6 +18,10 @@ pub trait SttBackend: Send {
 
     /// Request cancellation of in-flight work.
     fn cancel_inflight(&self);
+
+    /// Shared generation used by an external event loop to cancel a backend
+    /// while `transcribe` is running on a worker thread.
+    fn cancellation_generation(&self) -> Arc<AtomicU64>;
 
     /// Optional notice about the effective device used (for UI).
     fn take_device_notice(&mut self) -> Option<SttDeviceNotice>;
@@ -61,10 +66,11 @@ impl SttRunner {
             BackendKind::Ferrum => {
                 #[cfg(feature = "stt_ferrum")]
                 {
-                    let ferrum_cfg = cfg
-                        .ferrum
-                        .as_ref()
-                        .expect("Missing [stt.ferrum] config for ferrum backend");
+                    let ferrum_cfg = cfg.ferrum.as_ref().ok_or_else(|| {
+                        crate::common::MpvSttError::SttFailed(
+                            "Missing [stt.ferrum] configuration".to_string(),
+                        )
+                    })?;
                     Ok(SttRunner::Ferrum(ferrum::FerrumBackend::new(
                         ferrum_cfg.clone(),
                     )?))
@@ -80,10 +86,11 @@ impl SttRunner {
             BackendKind::OpenAi => {
                 #[cfg(feature = "stt_openai")]
                 {
-                    let openai_cfg = cfg
-                        .openai
-                        .as_ref()
-                        .expect("Missing [stt.openai] config for OpenAI backend");
+                    let openai_cfg = cfg.openai.as_ref().ok_or_else(|| {
+                        crate::common::MpvSttError::SttFailed(
+                            "Missing [stt.openai] configuration".to_string(),
+                        )
+                    })?;
                     Ok(SttRunner::OpenAi(openai::OpenAiBackend::new(
                         openai_cfg.clone(),
                     )?))
@@ -130,6 +137,15 @@ impl SttBackend for SttRunner {
             SttRunner::Ferrum(b) => b.cancel_inflight(),
             #[cfg(feature = "stt_openai")]
             SttRunner::OpenAi(b) => b.cancel_inflight(),
+        }
+    }
+
+    fn cancellation_generation(&self) -> Arc<AtomicU64> {
+        match self {
+            #[cfg(feature = "stt_ferrum")]
+            SttRunner::Ferrum(b) => b.cancellation_generation(),
+            #[cfg(feature = "stt_openai")]
+            SttRunner::OpenAi(b) => b.cancellation_generation(),
         }
     }
 
