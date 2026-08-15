@@ -76,7 +76,8 @@ ferrum 协议的服务端由 [subtitle-gateway](https://github.com/canxin121/sub
 cargo build --release
 cargo test
 
-# 产物(以 macOS 为例;动态链接 brew ffmpeg,约 5MB)
+# Cargo 原生产物(以 macOS 为例;动态链接 brew ffmpeg,约 5MB)。分发脚本会将
+# Mach-O 文件改名为 mpv 能识别的 .so 扩展名。
 ls target/release/libmpv_stt_plugin.dylib
 ```
 
@@ -106,8 +107,8 @@ export ANDROID_NDK_HOME=~/Android/Sdk/ndk/26.1.10909125
 | 平台 | FFmpeg 来源 | 产物 |
 |---|---|---|
 | Linux x86_64 | BtbN `linux64-lgpl-shared`(自动下载) | `dist/linux-x86_64/plugin/libmpv_stt_plugin.so` |
-| macOS arm64 | brew ffmpeg | `dist/darwin-arm64/plugin/libmpv_stt_plugin.dylib` |
-| macOS x86_64 | brew ffmpeg | `dist/darwin-x86_64/plugin/libmpv_stt_plugin.dylib` |
+| macOS arm64 | brew ffmpeg | `dist/darwin-arm64/plugin/libmpv_stt_plugin.so` |
+| macOS x86_64 | brew ffmpeg | `dist/darwin-x86_64/plugin/libmpv_stt_plugin.so` |
 | Windows x86_64 | BtbN `win64-lgpl-shared`(自动下载) | `dist/windows-x86_64/plugin/mpv_stt_plugin.dll` |
 | Android(arm64-v8a,默认) | Android 侧动态 libffmpeg(随 APK 分发) | `dist/android/<abi>/plugin/libmpv_stt_plugin.so` |
 
@@ -132,11 +133,40 @@ Linux / Windows 产物旁的 `dist/<平台>/runtime/` 里是插件需要的 FFmp
 # Linux / Android / Windows
 cp dist/linux-x86_64/plugin/libmpv_stt_plugin.so ~/.config/mpv/scripts/
 # macOS
-cp dist/darwin-arm64/plugin/libmpv_stt_plugin.dylib ~/.config/mpv/scripts/
+cp dist/darwin-arm64/plugin/libmpv_stt_plugin.so ~/.config/mpv/scripts/
 ```
 
 > Linux / Windows 若从 dist 分发,把 `dist/<平台>/runtime/` 里的 FFmpeg 库一起带上;
 > Windows 需放到 DLL 搜索路径(mpv.exe 同目录或 PATH)。
+
+### IINA 快捷键与重装
+
+插件加载后会直接向当前 mpv/IINA 播放器实例注册以下强绑定,不需要再修改
+IINA 的 `input.conf`:
+
+| 快捷键 | 功能 |
+|---|---|
+| `Ctrl+Shift+S` | 开启/停止实时字幕;停止后可再次开启 |
+| `Ctrl+Shift+T` | 开启/停止新字幕的自动翻译 |
+| `Ctrl+Shift+C` | 清除当前媒体的字幕与翻译缓存 |
+
+音频抽取和远程 STT 在独立 worker 中执行,不会占用 mpv/IINA 的事件线程。即使
+服务端正在推理或失去响应,上述快捷键、切换文件和退出仍会立即处理;停止、seek 或
+退出会取消旧请求,并用任务代次隔离迟到结果,避免旧视频字幕写进新会话。
+
+macOS 更新正在被 IINA/mpv 加载的动态库时,不要直接覆盖原文件。先完全退出
+IINA,再通过临时文件原子替换,避免系统把映射中的 Mach-O 判定为签名页失效:
+
+```bash
+mkdir -p ~/.config/mpv/scripts
+cp dist/darwin-arm64/plugin/libmpv_stt_plugin.so \
+  ~/.config/mpv/scripts/.libmpv_stt_plugin.so.new
+mv ~/.config/mpv/scripts/.libmpv_stt_plugin.so.new \
+  ~/.config/mpv/scripts/libmpv_stt_plugin.so
+```
+
+替换后重新启动 IINA。关闭一个视频、停止一次字幕或一次远程请求失败只会结束当前
+转写会话,不会终止整个插件;后续打开视频或再次按 `Ctrl+Shift+S` 会创建新会话。
 
 ### 配置
 
